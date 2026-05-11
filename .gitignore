@@ -1,0 +1,20 @@
+# Ignore output besar
+outputs/
+checkpoints/
+datasets/
+data/
+src/
+
+# Model
+*.pt
+*.pth
+*.ckpt
+*.ipynb
+
+# Cache
+__pycache__/
+.ipynb_checkpoints/
+
+# Environment
+.env
+venv/
