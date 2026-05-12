@@ -161,11 +161,6 @@ class Trainer:
         self.device   = torch.device(cfg.device)  # langsung dari cfg (mendukung mps/cpu/cuda)
         self._run_tag = run_tag
 
-    @property
-    def _raw_model(self):
-        """Kembalikan model tanpa nn.DataParallel wrapper (untuk akses buffer & submodul)."""
-        return self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
-
         # ── Paths ──────────────────────────────────────────────────────
         self.ckpt_dir   = Path(cfg.paths.checkpoint_dir)
         self.metric_dir = Path(cfg.paths.metric_dir)
@@ -197,6 +192,11 @@ class Trainer:
         _suffix = f"_{run_tag}" if run_tag else ""
         self.csv_path = self.metric_dir / f"{cfg.experiment_name}{_suffix}_train_log.csv"
         self._init_csv()
+
+    @property
+    def _raw_model(self):
+        """Kembalikan model tanpa nn.DataParallel wrapper (untuk akses buffer & submodul)."""
+        return self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
 
     def _init_csv(self, append: bool = False):
         """Inisialisasi file CSV untuk backup metrik per epoch.

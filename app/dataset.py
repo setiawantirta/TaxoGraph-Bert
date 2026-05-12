@@ -446,6 +446,52 @@ def build_weighted_sampler(dataset: SILVADataset, rank_idx: int = 4) -> Weighted
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# HF TOKENIZER WRAPPER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _DNABERTTokenizerWrapper:
+    """
+    Wrapper tipis di atas HuggingFace AutoTokenizer agar interfacenya identik
+    dengan KmerTokenizer.encode() / batch_encode().
+
+    Digunakan otomatis oleh build_dataloaders() saat backbone adalah DNABERT-2.
+    Menghindari CUDA OOB error yang disebabkan oleh KmerTokenizer yang menghasilkan
+    ID 4096-4099 sementara DNABERT-2 hanya memiliki 4096 slot embedding (0-4095).
+    """
+
+    def __init__(self, hf_tokenizer, max_len: int = 512):
+        self._tok      = hf_tokenizer
+        self.max_len   = max_len
+        self.vocab_size = hf_tokenizer.vocab_size
+
+    def encode(self, sequence: str) -> Dict[str, torch.Tensor]:
+        enc = self._tok(
+            sequence.upper(),
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_len,
+            return_tensors="pt",
+        )
+        return {
+            "input_ids":      enc["input_ids"].squeeze(0),
+            "attention_mask": enc["attention_mask"].squeeze(0),
+        }
+
+    def batch_encode(self, sequences: List[str]) -> Dict[str, torch.Tensor]:
+        enc = self._tok(
+            [s.upper() for s in sequences],
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_len,
+            return_tensors="pt",
+        )
+        return {
+            "input_ids":      enc["input_ids"],
+            "attention_mask": enc["attention_mask"],
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # COLLATE FUNCTION
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -489,26 +535,36 @@ def build_dataloaders(cfg) -> Tuple[DataLoader, DataLoader]:
     """
     from loguru import logger
 
-    kmer_tok = KmerTokenizer(
-        k=cfg.data.kmer_k,
-        max_len=cfg.data.max_seq_len,
-    )
+    # ── Pilih tokenizer: DNABERT-2 HF tokenizer (prioritas) atau k-mer fallback ──
+    # KmerTokenizer vocab_size=4100 (IDs 0-4099), tetapi DNABERT-2 embedding layer
+    # hanya punya 4096 slot (IDs 0-4095). ID 4096-4099 → CUDA device-side assert
+    # pada embedding lookup. Solusi: selalu gunakan tokenizer bawaan DNABERT-2.
+    tokenizer = None
+    backbone  = getattr(cfg.model, "transformer_backbone", None)
+    if backbone and backbone != "scratch":
+        try:
+            from transformers import AutoTokenizer as _AutoTok
+            _hf_tok   = _AutoTok.from_pretrained(backbone, trust_remote_code=True)
+            tokenizer = _DNABERTTokenizerWrapper(_hf_tok, max_len=cfg.data.max_seq_len)
+            logger.info(f"HF tokenizer: '{backbone}' (vocab_size={tokenizer.vocab_size})")
+        except Exception as _e:
+            logger.warning(f"Gagal muat HF tokenizer: {_e}. Fallback ke k-mer.")
 
-    # Buat DualTokenizer — gunakan BPE jika tersedia dan diaktifkan
-    bpe_tok = None
-    if getattr(cfg.data, "use_bpe", False):
-        vocab_path = getattr(cfg.paths, "vocab_bpe", None)
-        if vocab_path and Path(vocab_path).exists():
-            try:
-                bpe_tok = BPETokenizer.load(vocab_path, max_len=cfg.data.max_seq_len)
-                logger.info(f"BPE tokenizer dimuat dari {vocab_path}")
-            except Exception as e:
-                logger.warning(f"Gagal muat BPE vocab: {e}. Fallback ke k-mer.")
-        else:
-            logger.info("BPE vocab belum ada; gunakan k-mer tokenizer.")
-
-    tokenizer = DualTokenizer(kmer_tok, bpe_tok, use_bpe=getattr(cfg.data, "use_bpe", False))
-    logger.info(f"Tokenizer aktif: {'BPE' if tokenizer._using_bpe else 'k-mer (k=%d)' % cfg.data.kmer_k}")
+    if tokenizer is None:
+        kmer_tok = KmerTokenizer(k=cfg.data.kmer_k, max_len=cfg.data.max_seq_len)
+        bpe_tok  = None
+        if getattr(cfg.data, "use_bpe", False):
+            vocab_path = getattr(cfg.paths, "vocab_bpe", None)
+            if vocab_path and Path(vocab_path).exists():
+                try:
+                    bpe_tok = BPETokenizer.load(vocab_path, max_len=cfg.data.max_seq_len)
+                    logger.info(f"BPE tokenizer dimuat dari {vocab_path}")
+                except Exception as e:
+                    logger.warning(f"Gagal muat BPE vocab: {e}. Fallback ke k-mer.")
+            else:
+                logger.info("BPE vocab belum ada; gunakan k-mer tokenizer.")
+        tokenizer = DualTokenizer(kmer_tok, bpe_tok, use_bpe=getattr(cfg.data, "use_bpe", False))
+        logger.info(f"Tokenizer aktif: {'BPE' if tokenizer._using_bpe else 'k-mer (k=%d)' % cfg.data.kmer_k}")
 
     # Cek apakah HDF5 sudah tersedia
     train_path = cfg.paths.hdf5_train

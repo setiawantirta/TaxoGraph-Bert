@@ -86,25 +86,174 @@ class DNASequenceEncoder(nn.Module):
             try:
                 from transformers import AutoModel, AutoConfig
                 from peft import get_peft_model, LoraConfig, TaskType
+                import math as _math
+                import sys as _sys
+                import types as _types
 
                 config = AutoConfig.from_pretrained(backbone, trust_remote_code=True)
-                # Patch pad_token_id jika tidak ada (DNABERT-2 custom BertConfig tidak selalu menyertakannya)
                 if not hasattr(config, "pad_token_id") or config.pad_token_id is None:
                     config.pad_token_id = 0
+
+                # ── FASE 1: Download + import bert_layers, lalu patch BertEncoder ─
+                # Root cause: di dalam accelerate's init_empty_weights() context,
+                # torch.arange(device=None) → meta, TETAPI torch.Tensor(python_list)
+                # SELALU → CPU (konstruktor lama mengabaikan context). Operasi
+                # slopes * -relative_position (CPU × meta) → RuntimeError.
+                # Solusi: import bert_layers lebih dulu via dynamic_module_utils,
+                # patch BertEncoder.rebuild_alibi_tensor di kelas, lalu panggil
+                # from_pretrained — yang menggunakan kelas ter-patch dari sys.modules.
+                _BertEncoder = None
+                try:
+                    from transformers.dynamic_module_utils import (
+                        get_class_from_dynamic_module as _gcfdm,
+                    )
+                    # Picu download + import bert_layers.py ke sys.modules
+                    try:
+                        _gcfdm("bert_layers.BertModel", backbone, trust_remote_code=True)
+                    except TypeError:
+                        try:
+                            _gcfdm("bert_layers.BertModel", backbone)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    # Cari BertEncoder di semua modul yang baru diimpor
+                    for _mk, _mv in list(_sys.modules.items()):
+                        if (
+                            isinstance(_mv, _types.ModuleType)
+                            and "bert_layers" in _mk
+                            and hasattr(_mv, "BertEncoder")
+                        ):
+                            _BertEncoder = _mv.BertEncoder
+                            break
+                except ImportError:
+                    pass
+
+                if _BertEncoder is not None:
+                    def _fixed_rebuild_alibi(self, size: int, device=None) -> None:
+                        import math as _m
+
+                        n_heads = self.num_attention_heads
+
+                        def _get_slopes(n: int):
+                            def _pow2(n):
+                                s = 2 ** (-2 ** -(_m.log2(n) - 3))
+                                return [s * s ** i for i in range(n)]
+                            if _m.log2(n).is_integer():
+                                return _pow2(n)
+                            c = 2 ** _m.floor(_m.log2(n))
+                            return _pow2(c) + _get_slopes(2 * c)[0::2][: n - c]
+
+                        # device=None → ikut torch.device() context (meta saat init,
+                        # cpu saat dipanggil manual setelah loading)
+                        cp = torch.arange(size, device=device)[:, None]
+                        mp = torch.arange(size, device=device)[None, :]
+                        rp = torch.abs(mp - cp).unsqueeze(0).expand(n_heads, -1, -1)
+                        # FIX: slopes pada device yang SAMA dengan cp (bukan selalu CPU)
+                        slopes = torch.tensor(
+                            _get_slopes(n_heads), dtype=torch.float32, device=cp.device
+                        )
+                        alibi = slopes.view(n_heads, 1, 1) * -rp
+                        self._current_alibi_size = size
+                        self.alibi = alibi.unsqueeze(0)
+
+                    _BertEncoder.rebuild_alibi_tensor = _fixed_rebuild_alibi
+                    print("[DNASequenceEncoder] BertEncoder.rebuild_alibi_tensor berhasil di-patch.")
+                else:
+                    print(
+                        "[DNASequenceEncoder] PERINGATAN: patch BertEncoder tidak dilakukan "
+                        "(kelas tidak ditemukan di sys.modules — kemungkinan versi "
+                        "transformers tidak kompatibel). Error meta-device mungkin muncul."
+                    )
+
+                # ── FASE 2: Load model (menggunakan kelas ter-patch) ────────────
                 self.encoder = AutoModel.from_pretrained(
-                    backbone, config=config, trust_remote_code=True
+                    backbone, config=config, trust_remote_code=True,
+                    low_cpu_mem_usage=False,
+                    _fast_init=False,
                 )
 
+                # ── FASE 3: Materialize sisa meta tensor setelah from_pretrained ─
+                # named_parameters() dan named_buffers() untuk parameter/buffer biasa.
+                def _mat_cpu(m: "nn.Module") -> None:
+                    for _nm, _p in list(m.named_parameters()):
+                        if not _p.is_meta:
+                            continue
+                        _fill = torch.zeros(_p.shape, dtype=_p.dtype, device="cpu")
+                        _sub = m
+                        for _pt in _nm.split(".")[:-1]:
+                            _sub = getattr(_sub, _pt)
+                        _sub._parameters[_nm.split(".")[-1]] = nn.Parameter(
+                            _fill, requires_grad=_p.requires_grad
+                        )
+                    for _nm, _b in list(m.named_buffers()):
+                        if _b is None or not _b.is_meta:
+                            continue
+                        _fill = torch.zeros(_b.shape, dtype=_b.dtype, device="cpu")
+                        _sub = m
+                        for _pt in _nm.split(".")[:-1]:
+                            _sub = getattr(_sub, _pt)
+                        _sub._buffers[_nm.split(".")[-1]] = _fill
+
+                _mat_cpu(self.encoder)
+
+                # ── Null-out flash_attn_qkvpacked_func di semua modul bert_layers ──
+                # DNABERT-2 bert_layers.py memilih Triton vs torch dengan memeriksa
+                # apakah `flash_attn_qkvpacked_func is None` (baris ~161), BUKAN via
+                # attn_impl config. Triton ≥2.1 menghapus `trans_b` dari tl.dot() →
+                # CompilationError pada first forward pass.
+                # Fix: set simbol ke None di semua modul bert_layers yang ada di
+                # sys.modules agar forward() selalu masuk ke cabang PyTorch native.
+                for _mk, _mv in list(_sys.modules.items()):
+                    if "bert_layers" in _mk and isinstance(_mv, _types.ModuleType):
+                        if getattr(_mv, "flash_attn_qkvpacked_func", None) is not None:
+                            _mv.flash_attn_qkvpacked_func = None
+                            print(f"[DNASequenceEncoder] flash_attn dinon-aktifkan di {_mk!r}.")
+
+                # BertEncoder.alibi = plain tensor attribute (bukan buffer/parameter).
+                # Setelah from_pretrained di dalam meta context, alibi masih meta.
+                # Module.to() melewatinya → rebuild manual pada CPU.
+                for _mod in self.encoder.modules():
+                    if (
+                        hasattr(_mod, "alibi")
+                        and isinstance(_mod.alibi, torch.Tensor)
+                        and _mod.alibi.is_meta
+                        and hasattr(_mod, "rebuild_alibi_tensor")
+                        and hasattr(_mod, "_current_alibi_size")
+                    ):
+                        _mod.rebuild_alibi_tensor(
+                            size=_mod._current_alibi_size, device="cpu"
+                        )
+
                 if use_lora:
+                    # DNABERT-2 (MosaicBERT) menggunakan fused QKV:
+                    # satu Linear 'Wqkv' (768→2304) per attention layer,
+                    # BUKAN modul 'query'/'key'/'value' terpisah seperti HF BERT.
                     lora_cfg = LoraConfig(
                         task_type=TaskType.FEATURE_EXTRACTION,
                         r=lora_r,
                         lora_alpha=lora_alpha,
                         lora_dropout=lora_dropout,
-                        target_modules=["query", "value"],
+                        target_modules=["Wqkv"],
                         bias="none",
                     )
                     self.encoder = get_peft_model(self.encoder, lora_cfg)
+
+                    # Materialize PEFT-created meta tensors (LoRA A/B layers)
+                    for _nm, _p in list(self.encoder.named_parameters()):
+                        if not _p.is_meta:
+                            continue
+                        _fill = torch.empty(_p.shape, dtype=_p.dtype, device="cpu")
+                        if ".lora_A." in _nm:
+                            nn.init.kaiming_uniform_(_fill, a=_math.sqrt(5))
+                        else:
+                            nn.init.zeros_(_fill)
+                        _sub = self.encoder
+                        for _pt in _nm.split(".")[:-1]:
+                            _sub = getattr(_sub, _pt)
+                        _sub._parameters[_nm.split(".")[-1]] = nn.Parameter(
+                            _fill, requires_grad=_p.requires_grad
+                        )
 
                 self._using_pretrained = True
                 print(f"[DNASequenceEncoder] DNABERT-2 berhasil dimuat (mode='{encoder_mode}').")
@@ -184,8 +333,19 @@ class DNASequenceEncoder(nn.Module):
         Return:
             (B, hidden_dim) float sequence embeddings
         """
-        out    = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        hidden = out.last_hidden_state  # (B, L, hidden_dim)
+        out = self.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True,
+        )
+        # DNABERT-2/MosaicBERT kadang mengembalikan tuple bukan BaseModelOutput.
+        # Elemen pertama tuple adalah last_hidden_state.
+        if hasattr(out, "last_hidden_state"):
+            hidden = out.last_hidden_state          # (B, L, hidden_dim)
+        elif isinstance(out, (tuple, list)):
+            hidden = out[0]                         # (B, L, hidden_dim)
+        else:
+            raise TypeError(f"Output encoder tidak dikenal: {type(out)}")
         return self.pool(hidden, attention_mask)
 
 
@@ -656,6 +816,73 @@ class TaxoGraphBERT(nn.Module):
 
 
 # ───────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ───────────────────────────────────────────────────────────────────────────────
+
+def _materialize_meta_tensors(module: nn.Module) -> int:
+    """
+    Scan every parameter and buffer in *module* recursively using full dotted
+    names (named_parameters / named_buffers). Any tensor still on the PyTorch
+    'meta' device is replaced with a real CPU tensor so that model.to(device)
+    does not raise:
+        RuntimeError: Tensor on device meta is not on the expected device cpu!
+
+    Uses accelerate.utils.set_module_tensor_to_device when available (handles
+    tied weights and hooks correctly), otherwise falls back to manual patching
+    via the dotted attribute path.
+    LoRA A matrices get kaiming-uniform init; everything else is zeros.
+    Returns the number of tensors that were materialised.
+    """
+    import math as _math
+
+    try:
+        from accelerate.utils import set_module_tensor_to_device as _set
+        _use_acc = True
+    except ImportError:
+        _use_acc = False
+
+    count = 0
+
+    # ── parameters ──────────────────────────────────────────────────────────
+    for param_name, param in list(module.named_parameters()):
+        if not param.is_meta:
+            continue
+        fill = torch.empty(param.shape, dtype=param.dtype, device="cpu")
+        if ".lora_A." in param_name or param_name.endswith(".lora_A"):
+            nn.init.kaiming_uniform_(fill, a=_math.sqrt(5))
+        else:
+            nn.init.zeros_(fill)
+        if _use_acc:
+            _set(module, param_name, "cpu", value=fill)
+        else:
+            parts = param_name.split(".")
+            m = module
+            for part in parts[:-1]:
+                m = getattr(m, part)
+            m._parameters[parts[-1]] = nn.Parameter(
+                fill, requires_grad=param.requires_grad
+            )
+        count += 1
+
+    # ── buffers ─────────────────────────────────────────────────────────────
+    for buf_name, buf in list(module.named_buffers()):
+        if buf is None or not buf.is_meta:
+            continue
+        fill = torch.zeros(buf.shape, dtype=buf.dtype, device="cpu")
+        if _use_acc:
+            _set(module, buf_name, "cpu", value=fill)
+        else:
+            parts = buf_name.split(".")
+            m = module
+            for part in parts[:-1]:
+                m = getattr(m, part)
+            m._buffers[parts[-1]] = fill
+        count += 1
+
+    return count
+
+
+# ───────────────────────────────────────────────────────────────────────────────
 # BUILDER
 # ───────────────────────────────────────────────────────────────────────────────
 
@@ -681,6 +908,13 @@ def build_model(cfg, label_encoder, edge_index: Tensor, leaf_node_ids: Optional[
         edge_index=edge_index,
         leaf_node_ids=leaf_node_ids,
     )
+
+    # Materialize any meta-device tensors before moving to the target device.
+    # Catches meta tensors from DNABERT-2 custom code, PEFT init_empty_weights,
+    # accelerate, etc. — regardless of origin.
+    n_meta = _materialize_meta_tensors(model)
+    if n_meta:
+        print(f"[build_model] Materialized {n_meta} meta tensor(s) to CPU.")
 
     # Dukung MPS (Apple Silicon), CUDA, dan CPU langsung dari cfg.device
     device = torch.device(cfg.device)

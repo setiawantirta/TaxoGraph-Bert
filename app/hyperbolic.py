@@ -338,8 +338,12 @@ class HyTaxGNN(nn.Module):
             # LayerNorm di tangent space (Euclidean normalization)
             h_tan = self.ball.logmap0(h_new)             # → tangent space
             h_tan = ln(h_tan)
-            # Scale down sebelum expmap0 agar norm tidak jenuh di batas bola
-            h_tan = h_tan / (h_tan.detach().norm(dim=-1, keepdim=True).clamp(min=1.0) * (h_tan.shape[-1] ** 0.5))
+            # Scale down sebelum expmap0 agar norm tidak jenuh di batas bola.
+            # CATATAN: faktor (hidden_dim ** 0.5) dihapus — faktor itu membagi
+            # embedding dengan ~11.3 (sqrt(128)) sehingga semua titik menumpuk
+            # dekat origin Poincaré ball dan jarak hiperbolik antar node menjadi
+            # identik (~0.017), membuat Phase 1 margin-loss selalu 0.5.
+            h_tan = h_tan / h_tan.detach().norm(dim=-1, keepdim=True).clamp(min=1.0)
             h = self.ball.expmap0(h_tan)                 # → kembali ke Poincaré
 
         return h  # (N, hidden_dim) — di Poincaré ball

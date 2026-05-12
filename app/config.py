@@ -105,7 +105,9 @@ class ModelConfig:
     lora_r: int = 16                             # rank LoRA
     lora_alpha: int = 32                         # scaling factor α
     lora_dropout: float = 0.05
-    lora_target_modules: List[str] = field(default_factory=lambda: ["query", "value"])
+    # DNABERT-2 (MosaicBERT) uses a single fused Linear 'Wqkv' (hidden→3*hidden)
+    # instead of separate 'query'/'key'/'value' modules like standard HF BERT.
+    lora_target_modules: List[str] = field(default_factory=lambda: ["Wqkv"])
 
     # Hyperbolic Taxonomy GNN (HyTaxGNN)
     hgnn_hidden_dim: int = 128                   # dim embedding hiperbolik setiap node
