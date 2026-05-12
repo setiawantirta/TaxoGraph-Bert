@@ -161,6 +161,11 @@ class Trainer:
         self.device   = torch.device(cfg.device)  # langsung dari cfg (mendukung mps/cpu/cuda)
         self._run_tag = run_tag
 
+    @property
+    def _raw_model(self):
+        """Kembalikan model tanpa nn.DataParallel wrapper (untuk akses buffer & submodul)."""
+        return self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+
         # ── Paths ──────────────────────────────────────────────────────
         self.ckpt_dir   = Path(cfg.paths.checkpoint_dir)
         self.metric_dir = Path(cfg.paths.metric_dir)
@@ -193,8 +198,16 @@ class Trainer:
         self.csv_path = self.metric_dir / f"{cfg.experiment_name}{_suffix}_train_log.csv"
         self._init_csv()
 
-    def _init_csv(self):
-        """Inisialisasi file CSV untuk backup metrik per epoch."""
+    def _init_csv(self, append: bool = False):
+        """Inisialisasi file CSV untuk backup metrik per epoch.
+
+        Parameter:
+            append : jika True dan file sudah ada, pertahankan isinya (resume mode).
+                     jika False (default), buat ulang file dari awal.
+        """
+        if append and self.csv_path.exists():
+            logger.info(f"CSV log (resume/append): {self.csv_path}")
+            return  # pertahankan file yang sudah ada
         with open(self.csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=[
                 "epoch", "phase", "loss_total",
@@ -225,14 +238,14 @@ class Trainer:
         try:
             import geoopt
             optimizer_p1 = geoopt.optim.RiemannianSGD(
-                self.model.hytaxgnn.parameters(),
+                self._raw_model.hytaxgnn.parameters(),
                 lr=self.cfg.train.pretrain_hgnn_lr,
                 stabilize=10,
             )
         except ImportError:
             logger.warning("geoopt tidak terinstal, fallback ke AdamW untuk Phase 1.")
             optimizer_p1 = AdamW(
-                self.model.hytaxgnn.parameters(),
+                self._raw_model.hytaxgnn.parameters(),
                 lr=self.cfg.train.pretrain_hgnn_lr,
             )
 
@@ -248,23 +261,23 @@ class Trainer:
         try:
             if is_cuda:
                 for name in ('seq_encoder', 'fusion', 'classifier', 'ood_head'):
-                    submod = getattr(self.model, name)
+                    submod = getattr(self._raw_model, name)
                     submod.cpu()
                     _offloaded_mods.append((name, submod))
                 torch.cuda.empty_cache()
                 logger.info("Phase 1: submodul non-HyTaxGNN dioffload ke CPU (VRAM freed).")
 
             edge_batch_size = getattr(self.cfg.train, 'phase1_edge_batch_size', 4096)
-            edge_index_p1   = self.model.edge_index  # sudah ada di device
+            edge_index_p1   = self._raw_model.edge_index  # sudah ada di device
             E               = edge_index_p1.shape[1]
 
             pbar = tqdm(range(n_epochs), desc="Phase 1 — HyTaxGNN Pre-train", unit="epoch")
             for epoch in pbar:
-                self.model.hytaxgnn.train()
+                self._raw_model.hytaxgnn.train()
                 optimizer_p1.zero_grad()
 
                 # Dapatkan semua node embeddings
-                node_emb = self.model.hytaxgnn(edge_index_p1)  # (N, d)
+                node_emb = self._raw_model.hytaxgnn(edge_index_p1)  # (N, d)
 
                 # Mini-batch edges: hindari spike memori saat E sangat besar
                 perm    = torch.randperm(E, device=self.device)[:min(edge_batch_size, E)]
@@ -273,11 +286,11 @@ class Trainer:
                 B_e     = src_b.shape[0]
 
                 # Jarak parent-child (harus kecil)
-                d_pos = self.model.ball.dist(node_emb[src_b], node_emb[dst_b]).mean()
+                d_pos = self._raw_model.ball.dist(node_emb[src_b], node_emb[dst_b]).mean()
 
                 # Jarak random pairs (harus lebih besar)
                 rnd_idx = torch.randint(0, node_emb.shape[0], (B_e,), device=self.device)
-                d_neg   = self.model.ball.dist(node_emb[src_b], node_emb[rnd_idx]).mean()
+                d_neg   = self._raw_model.ball.dist(node_emb[src_b], node_emb[rnd_idx]).mean()
 
                 # Margin-based loss: d_pos < d_neg - margin
                 margin = 0.5
@@ -292,7 +305,7 @@ class Trainer:
 
             # Simpan checkpoint Phase 1
             ckpt_p1 = self.ckpt_dir / "phase1_hgnn.pt"
-            torch.save({"hgnn_state": self.model.hytaxgnn.state_dict(), "epoch": n_epochs}, ckpt_p1)
+            torch.save({"hgnn_state": self._raw_model.hytaxgnn.state_dict(), "epoch": n_epochs}, ckpt_p1)
             logger.info(f"Phase 1 selesai. Checkpoint: {ckpt_p1}")
 
         finally:
@@ -314,12 +327,12 @@ class Trainer:
         mcfg = self.cfg.model
 
         # Kelompokkan parameter berdasarkan komponen
-        transformer_params = list(self.model.seq_encoder.parameters())
+        transformer_params = list(self._raw_model.seq_encoder.parameters())
         other_params = (
-            list(self.model.hytaxgnn.parameters())
-            + list(self.model.fusion.parameters())
-            + list(self.model.classifier.parameters())
-            + list(self.model.ood_head.parameters())
+            list(self._raw_model.hytaxgnn.parameters())
+            + list(self._raw_model.fusion.parameters())
+            + list(self._raw_model.classifier.parameters())
+            + list(self._raw_model.ood_head.parameters())
         )
 
         self.optimizer = AdamW([
@@ -351,17 +364,37 @@ class Trainer:
         """Public alias untuk _build_optimizers — kompatibilitas notebook."""
         self._build_optimizers()
 
-    def train(self):
+    def train(self, start_epoch: Optional[int] = None):
         """
         Main training loop — Phase 2 joint fine-tuning.
         Jalankan setelah phase1_pretrain_hgnn().
+
+        Parameter:
+            start_epoch : epoch terakhir yang sudah selesai.
+                          Jika None (default), auto-detect dari checkpoint terbaru.
+                          Pass 0 untuk memaksa mulai dari awal.
         """
         logger.info("=== PHASE 2: Joint Fine-tuning ===")
         if self.optimizer is None:
             self._build_optimizers()
         tcfg = self.cfg.train
 
-        epoch_pbar = tqdm(range(1, tcfg.max_epochs + 1),
+        # ── Auto-resume ───────────────────────────────────────────────
+        if start_epoch is None:
+            start_epoch = self.resume_from_latest()
+
+        is_resume = start_epoch > 0
+        if is_resume:
+            # Jangan overwrite CSV epoch sebelumnya
+            self._init_csv(append=True)
+            logger.info(f"Training dilanjutkan dari epoch {start_epoch + 1} / {tcfg.max_epochs}")
+        else:
+            # Fresh start — tulis ulang header CSV
+            self._init_csv(append=False)
+
+        self._training_complete = False
+
+        epoch_pbar = tqdm(range(start_epoch + 1, tcfg.max_epochs + 1),
                           desc="Epoch", unit="epoch", position=0, leave=True)
 
         for epoch in epoch_pbar:
@@ -426,6 +459,8 @@ class Trainer:
             # Selalu simpan checkpoint terbaru
             self._save_checkpoint(epoch, "latest")
 
+        # Tandai training selesai (digunakan saat simpan _latest checkpoint terakhir)
+        self._training_complete = True
         # Kalibrasi OOD head setelah training selesai
         self._calibrate_ood()
 
@@ -578,12 +613,17 @@ class Trainer:
         Berisi: model state_dict, optimizer state, epoch, best_val_f1
         """
         ckpt = {
-            "epoch":         epoch,
-            "model_state":   self.model.state_dict(),
-            "optimizer":     self.optimizer.state_dict(),
-            "best_val_f1":   self.best_val_f1,
-            "val_f1_macro":  self.best_val_f1,  # alias agar notebook Phase 2 cell tidak KeyError
-            "cfg":           self.cfg,
+            "epoch":              epoch,
+            "model_state":        self._raw_model.state_dict(),
+            "optimizer":          self.optimizer.state_dict(),
+            "scheduler":          self.scheduler.state_dict() if self.scheduler else None,
+            "scaler":             self.scaler.state_dict(),
+            "best_val_f1":        self.best_val_f1,
+            "val_f1_macro":       self.best_val_f1,  # alias agar notebook Phase 2 cell tidak KeyError
+            "patience_ctr":       self.patience_ctr,
+            "global_step":        self.global_step,
+            "training_complete":  tag == "latest" and getattr(self, "_training_complete", False),
+            "cfg":                self.cfg,
         }
         path = self.ckpt_dir / f"{self.cfg.experiment_name}{'_' + self._run_tag if self._run_tag else ''}_{tag}.pt"
         torch.save(ckpt, path)
@@ -596,12 +636,69 @@ class Trainer:
             path : path file checkpoint .pt
         """
         ckpt = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(ckpt["model_state"])
+        self._raw_model.load_state_dict(ckpt["model_state"])
         if self.optimizer and "optimizer" in ckpt:
             self.optimizer.load_state_dict(ckpt["optimizer"])
-        self.best_val_f1 = ckpt.get("best_val_f1", 0.0)
+        if self.scheduler and ckpt.get("scheduler"):
+            self.scheduler.load_state_dict(ckpt["scheduler"])
+        if ckpt.get("scaler"):
+            self.scaler.load_state_dict(ckpt["scaler"])
+        self.best_val_f1  = ckpt.get("best_val_f1", 0.0)
+        self.patience_ctr = ckpt.get("patience_ctr", 0)
+        self.global_step  = ckpt.get("global_step", 0)
         logger.info(f"Checkpoint dimuat: {path} (epoch={ckpt['epoch']}, "
                     f"best_f1={self.best_val_f1:.4f})")
+
+    def resume_from_latest(self) -> int:
+        """
+        Cari checkpoint *_latest.pt dan muat semua state untuk melanjutkan training.
+
+        Return:
+            Epoch terakhir yang selesai (0 jika tidak ada checkpoint / fresh start).
+
+        Perilaku:
+            - Jika latest checkpoint ada dan training_complete=True → return epoch (sudah selesai)
+            - Jika latest checkpoint ada dan training_complete=False → restore state, return epoch
+            - Jika tidak ada checkpoint → return 0 (fresh start)
+        """
+        import glob as _glob
+        _suffix = f"_{self._run_tag}" if self._run_tag else ""
+        pattern = str(self.ckpt_dir / f"{self.cfg.experiment_name}{_suffix}_latest.pt")
+        matches = sorted(_glob.glob(pattern))
+
+        if not matches:
+            logger.info("Resume: tidak ada checkpoint ditemukan — mulai dari awal.")
+            return 0
+
+        ckpt_path = matches[-1]
+        ckpt = torch.load(ckpt_path, map_location=self.device)
+        last_epoch = ckpt.get("epoch", 0)
+
+        if ckpt.get("training_complete", False):
+            logger.info(f"Resume: training sudah selesai di epoch {last_epoch} — skip training.")
+            return last_epoch
+
+        # Restore model state
+        self._raw_model.load_state_dict(ckpt["model_state"])
+
+        # Bangun optimizer/scheduler dulu jika belum ada, lalu restore state
+        if self.optimizer is None:
+            self._build_optimizers()
+        self.optimizer.load_state_dict(ckpt["optimizer"])
+        if self.scheduler and ckpt.get("scheduler"):
+            self.scheduler.load_state_dict(ckpt["scheduler"])
+        if ckpt.get("scaler"):
+            self.scaler.load_state_dict(ckpt["scaler"])
+
+        self.best_val_f1  = ckpt.get("best_val_f1", 0.0)
+        self.patience_ctr = ckpt.get("patience_ctr", 0)
+        self.global_step  = ckpt.get("global_step", 0)
+
+        logger.info(
+            f"Resume dari epoch {last_epoch} | best_f1={self.best_val_f1:.4f} | "
+            f"patience={self.patience_ctr} | global_step={self.global_step}"
+        )
+        return last_epoch
 
     @torch.no_grad()
     def _calibrate_ood(self):
@@ -613,8 +710,8 @@ class Trainer:
         logger.info("Mengkalibrasi OOD threshold dari validation set...")
         self.model.eval()
 
-        node_emb = self.model.get_node_embeddings().to(self.device)
-        leaf_emb = node_emb[self.model.leaf_node_ids]
+        node_emb = self._raw_model.get_node_embeddings().to(self.device)
+        leaf_emb = node_emb[self._raw_model.leaf_node_ids]
 
         all_scores = []
         for batch in tqdm(self.val_dl, desc="OOD calibration", leave=False):
@@ -623,12 +720,12 @@ class Trainer:
 
             out    = self.model(input_ids, attention_mask, update_graph=False)
             z_hyp  = out["hyp_emb"]  # (B, d)
-            scores = self.model.ood_head.compute_ood_score(z_hyp, leaf_emb)  # (B,)
+            scores = self._raw_model.ood_head.compute_ood_score(z_hyp, leaf_emb)  # (B,)
             all_scores.append(scores.cpu())
 
         if all_scores:
             all_scores_tensor = torch.cat(all_scores, dim=0)
-            self.model.ood_head.calibrate(all_scores_tensor)
-            logger.info(f"OOD threshold dikalibrasi: delta = {self.model.ood_head.threshold.item():.4f}")
+            self._raw_model.ood_head.calibrate(all_scores_tensor)
+            logger.info(f"OOD threshold dikalibrasi: delta = {self._raw_model.ood_head.threshold.item():.4f}")
         else:
             logger.warning("Val set kosong; OOD threshold tidak dikalibrasi.")

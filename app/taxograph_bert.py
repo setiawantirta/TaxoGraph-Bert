@@ -686,8 +686,18 @@ def build_model(cfg, label_encoder, edge_index: Tensor, leaf_node_ids: Optional[
     device = torch.device(cfg.device)
     model  = model.to(device)
 
-    n_params = sum(p.numel() for p in model.parameters())
-    n_train  = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # Auto-detect multi-GPU (DataParallel) — khusus CUDA
+    n_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
+    if n_gpus > 1:
+        print(f"[build_model] Terdeteksi {n_gpus} GPU → menggunakan nn.DataParallel "
+              f"(GPU: {', '.join(f'cuda:{i}' for i in range(n_gpus))})")
+        model = torch.nn.DataParallel(model)
+    elif n_gpus == 1:
+        print(f"[build_model] Single GPU terdeteksi (cuda:0)")
+
+    _base = model.module if isinstance(model, torch.nn.DataParallel) else model
+    n_params = sum(p.numel() for p in _base.parameters())
+    n_train  = sum(p.numel() for p in _base.parameters() if p.requires_grad)
     print(f"[build_model] Total params: {n_params:,} | Trainable: {n_train:,} "
           f"({n_train/n_params*100:.1f}%)")
 
