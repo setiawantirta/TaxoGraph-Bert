@@ -643,7 +643,7 @@ class Trainer:
         Parameter:
             path : path file checkpoint .pt
         """
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self._raw_model.load_state_dict(ckpt["model_state"])
         if self.optimizer and "optimizer" in ckpt:
             self.optimizer.load_state_dict(ckpt["optimizer"])
@@ -679,7 +679,7 @@ class Trainer:
             return 0
 
         ckpt_path = matches[-1]
-        ckpt = torch.load(ckpt_path, map_location=self.device)
+        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
         last_epoch = ckpt.get("epoch", 0)
 
         if ckpt.get("training_complete", False):
