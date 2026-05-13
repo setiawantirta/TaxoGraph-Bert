@@ -68,6 +68,7 @@ class DataConfig:
     dataloader_num_workers: int = 4              # parallel workers untuk DataLoader
     pin_memory: bool = True                      # pin memory GPU (True jika CUDA tersedia)
     prefetch_factor: int = 2                     # prefetch batches per worker
+    preload_to_ram: bool = False                 # True: preload HDF5 + pre-tokenize ke RAM; False: auto-detect
 
     # Taxonomic Roll-up
     min_samples_per_taxon: int = 5               # taksa < N → roll-up ke rank lebih tinggi
@@ -154,6 +155,12 @@ class TrainConfig:
     # PENTING: noise hanya untuk param Euclidean; HyTaxGNN (Poincaré) pakai LR spike 5× saja
     saddle_escape_patience: int = 8              # aktifkan setelah N epoch stagnan (plateau < saddle < early_stop)
     saddle_escape_noise_std: float = 1e-4        # std noise Gaussian (param Euclidean saja)
+
+    # Dual-metric early stopping
+    loss_min_delta: float = 1e-4                 # minimum loss improvement untuk reset loss_patience
+
+    # Model compile
+    compile_model: bool = True                   # torch.compile (PyTorch ≥ 2.0; try/except guarded)
 
     # Optimizer — Transformer backbone
     lr_transformer: float = 3e-5

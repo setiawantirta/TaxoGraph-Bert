@@ -35,6 +35,15 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, Sequ
 from tqdm.auto import tqdm
 from loguru import logger
 
+# IPython display — aman di lingkungan non-Jupyter (try/except)
+try:
+    from IPython.display import clear_output as _clear_output
+    from IPython.display import display as _ipy_display
+    from IPython.display import Image as _IPyImage
+    _IN_JUPYTER = True
+except ImportError:
+    _IN_JUPYTER = False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HIERARCHICAL CROSS-ENTROPY LOSS
@@ -184,12 +193,29 @@ class Trainer:
 
         # ── State ──────────────────────────────────────────────────────
         self.best_val_f1   = 0.0
-        self.patience_ctr  = 0
+        self.patience_ctr  = 0          # legacy — tidak dipakai di dual-metric cascade
         self.global_step   = 0
         self.epoch_metrics: List[Dict] = []
         self._plateau_lr_reductions  = 0      # jumlah reduksi LR akibat plateau
         self._hgnn_lr_spike_active   = False  # flag LR spike HyTaxGNN sedang aktif
         self._hgnn_lr_before_spike   = None   # simpan LR HGNN sebelum spike
+        self._model_compiled         = False  # flag torch.compile sudah dijalankan
+
+        # Dual-metric early stopping state
+        self.best_val_loss      = float("inf")
+        self.loss_patience_ctr  = 0           # counter berbasis val_loss (plateau/saddle)
+        self.f1_patience_ctr    = 0           # counter berbasis val_f1 (checkpoint/stop)
+
+        # Monitoring history (untuk patience plot)
+        self.history_epochs:     List[int]         = []
+        self.history_train_loss: List[float]       = []
+        self.history_val_loss:   List[float]       = []
+        self.history_val_f1:     List[float]       = []
+        self.patience_events:    List[Tuple[int, str]] = []  # (epoch, trigger_type)
+
+        # Plot directory
+        self.plot_dir = Path(cfg.paths.plot_dir)
+        self.plot_dir.mkdir(parents=True, exist_ok=True)
 
         # ── CSV backup ─────────────────────────────────────────────────
         _suffix = f"_{run_tag}" if run_tag else ""
@@ -228,6 +254,118 @@ class Trainer:
             writer.writerow(row)
 
     # ── Plateau & Saddle Mitigation ────────────────────────────────────────
+
+    def _plot_patience_monitor(self, epoch: int, trigger_type: str):
+        """
+        Simpan dan tampilkan monitoring chart (loss + F1) setiap patience aktif.
+
+        Plot disimpan ke outputs/plots/{experiment_name}_patience_monitor.png
+        (selalu overwrite — bukan akumulasi file).
+
+        Di Jupyter: ditampilkan inline dengan clear_output(wait=True)
+        sehingga update in-place dan tidak spam output.
+        Di non-Jupyter (script/CLI): disimpan ke file saja, tidak crash.
+
+        Parameter:
+            epoch        : epoch saat ini
+            trigger_type : "no_improve" | "plateau" | "saddle" | "stop"
+        """
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            logger.warning("[patience_monitor] matplotlib tidak tersedia; plot dilewati.")
+            return
+
+        if len(self.history_epochs) < 2:
+            return  # butuh minimal 2 data point untuk plot
+
+        tcfg      = self.cfg.train
+        plateau_p = getattr(tcfg, "plateau_patience", 5)
+        early_p   = getattr(tcfg, "early_stopping_patience", 10)
+
+        # Gaya per tipe event
+        _event_style = {
+            "no_improve": dict(color="silver",      lw=0.8, alpha=0.35, ls="--"),
+            "plateau":    dict(color="darkorange",  lw=1.5, alpha=0.80, ls="--"),
+            "saddle":     dict(color="crimson",     lw=1.5, alpha=0.80, ls="--"),
+            "stop":       dict(color="black",       lw=2.0, alpha=1.00, ls="-"),
+        }
+        _event_label = {
+            "no_improve": None,               # terlalu sering → tidak diberi label
+            "plateau":    "Plateau (LR↓)",
+            "saddle":     "Saddle Escape",
+            "stop":       "Early Stop",
+        }
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+        fig.suptitle(
+            f"Patience Monitor — Epoch {epoch}  |  "
+            f"loss_pat: {self.loss_patience_ctr}/{plateau_p}  |  "
+            f"f1_pat: {self.f1_patience_ctr}/{early_p}",
+            fontsize=11, fontweight="bold",
+        )
+
+        epochs = self.history_epochs
+
+        # ── Subplot 1: Loss ────────────────────────────────────────────────
+        ax1.plot(epochs, self.history_train_loss,
+                 color="steelblue",  lw=1.5, label="Train Loss")
+        ax1.plot(epochs, self.history_val_loss,
+                 color="darkorange", lw=1.5, ls="--", label="Val Loss")
+        ax1.set_xlabel("Epoch")
+        ax1.set_ylabel("Loss")
+        ax1.set_title("Loss Curve")
+        ax1.grid(True, alpha=0.3)
+        ax1.legend(fontsize=8)
+
+        # ── Subplot 2: F1 ──────────────────────────────────────────────────
+        ax2.plot(epochs, self.history_val_f1,
+                 color="seagreen", lw=1.5, label="Val F1 Macro")
+        ax2.set_xlabel("Epoch")
+        ax2.set_ylabel("F1 Macro")
+        ax2.set_title("Validation F1 Macro")
+        ax2.set_ylim(0, 1)
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(fontsize=8)
+
+        # ── Vertical lines untuk setiap patience event ─────────────────────
+        _labeled: set = set()
+        for ev_epoch, ev_type in self.patience_events:
+            style = _event_style.get(ev_type, _event_style["no_improve"])
+            label = _event_label.get(ev_type)
+            if label and label not in _labeled:
+                _labeled.add(label)
+            else:
+                label = None      # hindari label duplikat di legend
+            for ax in (ax1, ax2):
+                ax.axvline(x=ev_epoch, label=label, **style)
+
+        # Refresh legend setelah tambah vlines
+        for ax in (ax1, ax2):
+            handles, labels_l = ax.get_legend_handles_labels()
+            if handles:
+                ax.legend(handles, labels_l, fontsize=8)
+
+        plt.tight_layout()
+
+        # Simpan (selalu overwrite)
+        save_path = self.plot_dir / f"{self.cfg.experiment_name}_patience_monitor.png"
+        try:
+            plt.savefig(save_path, dpi=120, bbox_inches="tight")
+        except Exception as _e:
+            logger.warning(f"[patience_monitor] Gagal simpan plot: {_e}")
+        finally:
+            plt.close(fig)
+
+        logger.info(f"[patience_monitor] Plot disimpan: {save_path}  (trigger={trigger_type})")
+
+        # Tampilkan inline di Jupyter (update in-place)
+        if _IN_JUPYTER:
+            try:
+                _clear_output(wait=True)
+                _ipy_display(_IPyImage(filename=str(save_path)))
+            except Exception:
+                pass
 
     def _reduce_lr_on_plateau(self):
         """
@@ -479,6 +617,20 @@ class Trainer:
             self._build_optimizers()
         tcfg = self.cfg.train
 
+        # ── Throughput optimizations ──────────────────────────────────────
+        if self.device.type == 'cuda':
+            torch.backends.cudnn.benchmark = True
+        if (not self._model_compiled
+                and hasattr(torch, 'compile')
+                and not isinstance(self.model, torch.nn.DataParallel)
+                and getattr(tcfg, 'compile_model', True)):
+            try:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+                self._model_compiled = True
+                logger.info("torch.compile aktif (mode=reduce-overhead)")
+            except Exception as _e:
+                logger.warning(f"torch.compile dilewati: {_e}")
+
         # ── Auto-resume ───────────────────────────────────────────────
         if start_epoch is None:
             start_epoch = self.resume_from_latest()
@@ -517,6 +669,15 @@ class Trainer:
             elapsed = time.time() - t_start
             current_lr = self.optimizer.param_groups[0]["lr"]
 
+            val_loss = val_metrics.get("val_loss", float("inf"))
+            val_f1   = val_metrics.get("f1_macro", 0)
+
+            # History accumulation (untuk patience monitoring plot)
+            self.history_epochs.append(epoch)
+            self.history_train_loss.append(train_metrics.get("loss_total", 0.0))
+            self.history_val_loss.append(val_loss)
+            self.history_val_f1.append(val_f1)
+
             # Baris train terpisah
             train_row = {
                 "epoch":      epoch,
@@ -532,10 +693,10 @@ class Trainer:
             val_row = {
                 "epoch":      epoch,
                 "phase":      "val",
-                "loss_total": 0.0,
+                "loss_total": val_loss,
                 **{f"loss_rank_{r}": 0.0 for r in range(6)},
                 **{f"f1_{rn}": val_metrics.get(f"f1_{rn}", 0) for rn in self.RANK_NAMES},
-                "f1_macro":   val_metrics.get("f1_macro", 0),
+                "f1_macro":   val_f1,
                 "lr":         current_lr,
                 "elapsed_sec": elapsed,
             }
@@ -547,40 +708,54 @@ class Trainer:
             # Kembalikan LR HyTaxGNN jika spike aktif dari epoch sebelumnya
             self._restore_hgnn_lr_after_spike()
 
-            # Early stopping & checkpointing (dengan cascade plateau → saddle → stop)
-            val_f1    = val_metrics.get("f1_macro", 0)
-            min_delta = getattr(tcfg, "early_stopping_min_delta", 1e-4)
+            # ── Dual-Metric Early Stopping Cascade ────────────────────────────
+            f1_delta   = getattr(tcfg, "early_stopping_min_delta", 1e-4)
+            loss_delta = getattr(tcfg, "loss_min_delta", 1e-4)
+            plateau_p  = getattr(tcfg, "plateau_patience", 5)
+            saddle_p   = getattr(tcfg, "saddle_escape_patience", 8)
 
-            if val_f1 > self.best_val_f1 + min_delta:
-                self.best_val_f1  = val_f1
-                self.patience_ctr = 0
+            # — Loss-based cascade: deteksi plateau + saddle escape ——————————
+            if val_loss < self.best_val_loss - loss_delta:
+                self.best_val_loss     = val_loss
+                self.loss_patience_ctr = 0
+            else:
+                self.loss_patience_ctr += 1
+
+                if self.loss_patience_ctr == plateau_p:
+                    logger.warning(
+                        f"Epoch {epoch}: Plateau terdeteksi (loss tidak turun {plateau_p} "
+                        f"epoch) → mengurangi LR."
+                    )
+                    self._reduce_lr_on_plateau()
+                    trigger = "plateau"
+                elif self.loss_patience_ctr == saddle_p:
+                    logger.warning(
+                        f"Epoch {epoch}: Kemungkinan saddle point (loss stagnan {saddle_p} "
+                        f"epoch) → perturbasi Euclidean + LR spike HyTaxGNN + restart."
+                    )
+                    self._escape_saddle_point()
+                    trigger = "saddle"
+                else:
+                    trigger = "no_improve"
+
+                self.patience_events.append((epoch, trigger))
+                self._plot_patience_monitor(epoch, trigger)
+
+            # — F1-based checkpoint + early stop ———————————————————————————
+            if val_f1 > self.best_val_f1 + f1_delta:
+                self.best_val_f1     = val_f1
+                self.f1_patience_ctr = 0
                 self._save_checkpoint(epoch, "best")
                 logger.info(f"Epoch {epoch}: NEW BEST val F1 = {val_f1:.4f} → checkpoint disimpan")
             else:
-                self.patience_ctr += 1
-
-                # ── Cascade: Plateau → Saddle Escape → Early Stop ────────────
-                plateau_p = getattr(tcfg, "plateau_patience", 5)
-                saddle_p  = getattr(tcfg, "saddle_escape_patience", 8)
-
-                if self.patience_ctr == plateau_p:
-                    logger.warning(
-                        f"Epoch {epoch}: Plateau terdeteksi ({plateau_p} epoch stagnan) "
-                        f"→ mengurangi LR."
-                    )
-                    self._reduce_lr_on_plateau()
-
-                elif self.patience_ctr == saddle_p:
-                    logger.warning(
-                        f"Epoch {epoch}: Kemungkinan saddle point ({saddle_p} epoch stagnan) "
-                        f"→ perturbasi Euclidean + LR spike HyTaxGNN + scheduler restart."
-                    )
-                    self._escape_saddle_point()
-
-                if self.patience_ctr >= tcfg.early_stopping_patience:
+                self.f1_patience_ctr += 1
+                if self.f1_patience_ctr >= tcfg.early_stopping_patience:
+                    trigger = "stop"
+                    self.patience_events.append((epoch, trigger))
+                    self._plot_patience_monitor(epoch, trigger)
                     logger.info(
                         f"Early stopping triggered setelah {epoch} epoch "
-                        f"({self.patience_ctr} epoch tanpa improvement ≥ {min_delta})."
+                        f"({self.f1_patience_ctr} epoch tanpa F1 improvement ≥ {f1_delta})."
                     )
                     break
 
@@ -589,10 +764,11 @@ class Trainer:
 
             # Update postfix dengan info patience untuk monitoring
             epoch_pbar.set_postfix({
-                "val_f1_genus":   f"{val_metrics.get('f1_Genus', 0):.4f}",
-                "val_f1_species": f"{val_metrics.get('f1_Species', 0):.4f}",
-                "loss":           f"{train_metrics.get('loss_total', 0):.4f}",
-                "pat":            f"{self.patience_ctr}/{tcfg.early_stopping_patience}",
+                "val_f1":   f"{val_f1:.4f}",
+                "val_loss": f"{val_loss:.4f}",
+                "loss":     f"{train_metrics.get('loss_total', 0):.4f}",
+                "loss_pat": f"{self.loss_patience_ctr}/{plateau_p}",
+                "f1_pat":   f"{self.f1_patience_ctr}/{tcfg.early_stopping_patience}",
             })
 
         # Tandai training selesai (digunakan saat simpan _latest checkpoint terakhir)
@@ -685,10 +861,10 @@ class Trainer:
     @torch.no_grad()
     def _validate(self, epoch: int) -> Dict:
         """
-        Validasi model pada val_dl, hitung F1-Score per rank.
+        Validasi model pada val_dl, hitung F1-Score per rank dan val loss.
 
         Return:
-            dict F1 per rank + macro F1
+            dict F1 per rank + f1_macro + val_loss
         """
         from sklearn.metrics import f1_score
 
@@ -696,6 +872,9 @@ class Trainer:
 
         all_preds  = [[] for _ in range(6)]  # prediksi per rank
         all_labels = [[] for _ in range(6)]  # label benar per rank
+
+        total_val_loss = 0.0
+        n_val_batches  = 0
 
         pbar = tqdm(
             self.val_dl,
@@ -708,10 +887,16 @@ class Trainer:
         for batch in pbar:
             input_ids      = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
-            labels         = batch["labels"]  # tetap di CPU
+            labels         = batch["labels"]  # tetap di CPU untuk F1 collection
 
             out    = self.model(input_ids, attention_mask, update_graph=False)
             logits = out["logits"]
+
+            # Hitung val loss
+            labels_dev = labels.to(self.device)
+            _, loss_d  = self.criterion(logits, labels_dev)
+            total_val_loss += loss_d["loss_total"]
+            n_val_batches  += 1
 
             for r in range(6):
                 preds_r = logits[r].argmax(dim=-1).cpu().numpy()
@@ -737,6 +922,7 @@ class Trainer:
             logger.debug(f"    F1 {rname}: {f1:.4f}")
 
         metrics["f1_macro"] = float(np.mean(f1_values)) if f1_values else 0.0
+        metrics["val_loss"] = total_val_loss / max(n_val_batches, 1)
         return metrics
 
     # ── Checkpointing ─────────────────────────────────────────────────────
@@ -756,7 +942,10 @@ class Trainer:
             "scaler":             self.scaler.state_dict(),
             "best_val_f1":        self.best_val_f1,
             "val_f1_macro":       self.best_val_f1,  # alias agar notebook Phase 2 cell tidak KeyError
-            "patience_ctr":       self.patience_ctr,
+            "best_val_loss":      self.best_val_loss,
+            "patience_ctr":       self.f1_patience_ctr,  # backward-compat alias
+            "loss_patience_ctr":  self.loss_patience_ctr,
+            "f1_patience_ctr":    self.f1_patience_ctr,
             "global_step":        self.global_step,
             "training_complete":  tag == "latest" and getattr(self, "_training_complete", False),
             "cfg":                self.cfg,
@@ -779,11 +968,13 @@ class Trainer:
             self.scheduler.load_state_dict(ckpt["scheduler"])
         if ckpt.get("scaler"):
             self.scaler.load_state_dict(ckpt["scaler"])
-        self.best_val_f1  = ckpt.get("best_val_f1", 0.0)
-        self.patience_ctr = ckpt.get("patience_ctr", 0)
-        self.global_step  = ckpt.get("global_step", 0)
+        self.best_val_f1       = ckpt.get("best_val_f1", 0.0)
+        self.best_val_loss     = ckpt.get("best_val_loss", float("inf"))
+        self.loss_patience_ctr = ckpt.get("loss_patience_ctr", ckpt.get("patience_ctr", 0))
+        self.f1_patience_ctr   = ckpt.get("f1_patience_ctr",  ckpt.get("patience_ctr", 0))
+        self.global_step       = ckpt.get("global_step", 0)
         logger.info(f"Checkpoint dimuat: {path} (epoch={ckpt['epoch']}, "
-                    f"best_f1={self.best_val_f1:.4f})")
+                    f"best_f1={self.best_val_f1:.4f}, best_loss={self.best_val_loss:.4f})")
 
     def resume_from_latest(self) -> int:
         """
@@ -826,13 +1017,17 @@ class Trainer:
         if ckpt.get("scaler"):
             self.scaler.load_state_dict(ckpt["scaler"])
 
-        self.best_val_f1  = ckpt.get("best_val_f1", 0.0)
-        self.patience_ctr = ckpt.get("patience_ctr", 0)
-        self.global_step  = ckpt.get("global_step", 0)
+        self.best_val_f1       = ckpt.get("best_val_f1", 0.0)
+        self.best_val_loss     = ckpt.get("best_val_loss", float("inf"))
+        self.loss_patience_ctr = ckpt.get("loss_patience_ctr", ckpt.get("patience_ctr", 0))
+        self.f1_patience_ctr   = ckpt.get("f1_patience_ctr",  ckpt.get("patience_ctr", 0))
+        self.global_step       = ckpt.get("global_step", 0)
 
         logger.info(
             f"Resume dari epoch {last_epoch} | best_f1={self.best_val_f1:.4f} | "
-            f"patience={self.patience_ctr} | global_step={self.global_step}"
+            f"best_loss={self.best_val_loss:.4f} | "
+            f"loss_pat={self.loss_patience_ctr} | f1_pat={self.f1_patience_ctr} | "
+            f"global_step={self.global_step}"
         )
         return last_epoch
 

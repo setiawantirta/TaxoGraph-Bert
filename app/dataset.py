@@ -407,16 +407,112 @@ class SILVADataset(Dataset):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# RAM DATASET — preload seluruh HDF5 + pre-tokenize ke CPU tensor
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SILVADatasetRAM(Dataset):
+    """
+    Dataset PyTorch yang memuat seluruh HDF5 ke RAM dan pre-tokenize semua sekuens.
+    Jauh lebih cepat dari SILVADataset (tanpa I/O disk & tokenisasi per-item).
+
+    Auto-digunakan oleh build_dataloaders() saat RAM tersedia ≥ 2× estimasi data.
+    Fallback ke SILVADataset jika RAM tidak mencukupi.
+
+    Parameter:
+        hdf5_path  : path ke file HDF5 hasil preprocess.py
+        tokenizer  : instance _DNABERTTokenizerWrapper atau KmerTokenizer
+        augment    : apakah terapkan augmentasi (reverse complement on-the-fly)
+        batch_size : ukuran batch pre-tokenize (default 512)
+    """
+
+    def __init__(
+        self,
+        hdf5_path: str,
+        tokenizer,
+        augment: bool = False,
+        batch_size: int = 512,
+    ):
+        from loguru import logger
+
+        self.augment    = augment
+        self._tokenizer = tokenizer if augment else None
+
+        logger.info(f"SILVADatasetRAM: memuat '{hdf5_path}' ke RAM dan pre-tokenize...")
+
+        with h5py.File(hdf5_path, "r") as f:
+            n_samples = int(f.attrs["n_samples"])
+            seqs_raw  = [
+                s.decode("utf-8") if isinstance(s, bytes) else s
+                for s in f["sequences"][:]
+            ]
+            labels_np = f["labels"][:]   # (N, 6) int32
+            seq_ids   = [
+                s.decode("utf-8") if isinstance(s, bytes) else s
+                for s in f["seq_ids"][:]
+            ]
+
+        self.seq_ids = seq_ids
+        self.labels  = torch.tensor(labels_np, dtype=torch.long)  # (N, 6)
+
+        # Panjang token dari tokenizer
+        _max_len = getattr(tokenizer, "max_len", 512)
+
+        # Pre-tokenize semua sekuens dalam batch
+        all_input_ids      = torch.zeros(n_samples, _max_len, dtype=torch.long)
+        all_attention_mask = torch.zeros(n_samples, _max_len, dtype=torch.long)
+
+        for start in tqdm(range(0, n_samples, batch_size), desc="Pre-tokenize RAM", unit="batch"):
+            end = min(start + batch_size, n_samples)
+            enc = tokenizer.batch_encode(seqs_raw[start:end])
+            all_input_ids[start:end]      = enc["input_ids"]
+            all_attention_mask[start:end] = enc["attention_mask"]
+
+        self.input_ids      = all_input_ids       # (N, L) CPU tensor
+        self.attention_mask = all_attention_mask  # (N, L) CPU tensor
+
+        # Simpan raw seqs hanya jika augmentasi diperlukan
+        self._raw_seqs = seqs_raw if augment else None
+
+        _size_gb = (all_input_ids.numel() + all_attention_mask.numel()) * 4 / 1e9
+        logger.info(
+            f"SILVADatasetRAM siap: {n_samples:,} sampel | RAM digunakan ≈ {_size_gb:.2f} GB"
+        )
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        input_ids      = self.input_ids[idx]
+        attention_mask = self.attention_mask[idx]
+
+        # Augmentasi on-the-fly: reverse complement dengan probabilitas 50%
+        if self.augment and self._raw_seqs is not None and torch.rand(1).item() > 0.5:
+            seq = SILVADataset._reverse_complement(self._raw_seqs[idx])
+            enc = self._tokenizer.encode(seq)
+            input_ids      = enc["input_ids"]
+            attention_mask = enc["attention_mask"]
+
+        return {
+            "seq_id":         self.seq_ids[idx],
+            "input_ids":      input_ids,
+            "attention_mask": attention_mask,
+            "labels":         self.labels[idx],
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # WEIGHTED SAMPLER — atasi imbalance saat training
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_weighted_sampler(dataset: SILVADataset, rank_idx: int = 4) -> WeightedRandomSampler:
+def build_weighted_sampler(dataset, rank_idx: int = 4) -> WeightedRandomSampler:
     """
     Buat WeightedRandomSampler berdasarkan frekuensi kelas pada rank tertentu.
     Sampel dari kelas minoritas akan lebih sering muncul dalam epoch.
 
+    Mendukung SILVADataset (lazy HDF5) dan SILVADatasetRAM (tensor di RAM).
+
     Parameter:
-        dataset   : SILVADataset instance
+        dataset   : SILVADataset atau SILVADatasetRAM instance
         rank_idx  : index rank untuk bobot (0=Phylum, ..., 4=Genus, 5=Species)
 
     Return:
@@ -425,8 +521,13 @@ def build_weighted_sampler(dataset: SILVADataset, rank_idx: int = 4) -> Weighted
     from loguru import logger
 
     logger.info(f"Menghitung class weights untuk rank idx={rank_idx}...")
-    f = dataset._get_handle()
-    labels = f["labels"][:, rank_idx]  # baca semua label rank tertentu sekaligus
+
+    # Ambil label kolom rank_idx — mendukung kedua jenis dataset
+    if isinstance(dataset, SILVADatasetRAM):
+        labels = dataset.labels[:, rank_idx].numpy()
+    else:
+        f = dataset._get_handle()
+        labels = f["labels"][:, rank_idx]  # baca semua label rank tertentu sekaligus
 
     class_counts = np.bincount(labels)
     class_weights = 1.0 / (class_counts + 1e-6)  # inverse frequency
@@ -576,8 +677,43 @@ def build_dataloaders(cfg) -> Tuple[DataLoader, DataLoader]:
         # Return dummy loader untuk testing
         return _build_dummy_loaders(cfg, tokenizer)
 
-    train_ds = SILVADataset(train_path, tokenizer, augment=True,  cache_size=0)
-    val_ds   = SILVADataset(val_path,   tokenizer, augment=False, cache_size=0)
+    # ── Auto-detect: gunakan SILVADatasetRAM jika RAM tersedia ≥ 2× estimasi ──
+    _use_ram = bool(getattr(cfg.data, "preload_to_ram", False))
+    if not _use_ram:
+        try:
+            import psutil
+            with h5py.File(train_path, "r") as _fh:
+                _n_train = int(_fh.attrs["n_samples"])
+            with h5py.File(val_path, "r") as _fh:
+                _n_val = int(_fh.attrs["n_samples"])
+            _max_len   = cfg.data.max_seq_len
+            # input_ids + attention_mask, int32 = 4 bytes each
+            _est_bytes = (_n_train + _n_val) * _max_len * 4 * 2
+            _avail     = psutil.virtual_memory().available
+            if _avail > _est_bytes * 2.0:
+                _use_ram = True
+                logger.info(
+                    f"Auto-detect RAM: {_avail / 1e9:.1f} GB tersedia > "
+                    f"{_est_bytes * 2 / 1e9:.1f} GB dibutuhkan → SILVADatasetRAM"
+                )
+            else:
+                logger.info(
+                    f"Auto-detect RAM: {_avail / 1e9:.1f} GB tersedia < "
+                    f"{_est_bytes * 2 / 1e9:.1f} GB dibutuhkan → SILVADataset (lazy HDF5)"
+                )
+        except ImportError:
+            logger.info("psutil tidak tersedia; gunakan SILVADataset (lazy HDF5).")
+
+    if _use_ram:
+        train_ds   = SILVADatasetRAM(train_path, tokenizer, augment=True)
+        val_ds     = SILVADatasetRAM(val_path,   tokenizer, augment=False)
+        _n_workers = min(2, cfg.data.dataloader_num_workers)
+        logger.info("Dataset mode: RAM (SILVADatasetRAM)")
+    else:
+        train_ds   = SILVADataset(train_path, tokenizer, augment=True,  cache_size=0)
+        val_ds     = SILVADataset(val_path,   tokenizer, augment=False, cache_size=0)
+        _n_workers = cfg.data.dataloader_num_workers
+        logger.info("Dataset mode: Lazy HDF5 (SILVADataset)")
 
     logger.info(f"Dataset: Train={len(train_ds):,} | Val={len(val_ds):,}")
 
@@ -588,7 +724,7 @@ def build_dataloaders(cfg) -> Tuple[DataLoader, DataLoader]:
         train_ds,
         batch_size=cfg.train.batch_size,
         sampler=sampler,                             # WeightedRandom, bukan shuffle
-        num_workers=cfg.data.dataloader_num_workers,
+        num_workers=_n_workers,
         pin_memory=cfg.data.pin_memory,
         prefetch_factor=cfg.data.prefetch_factor,
         collate_fn=collate_fn,
@@ -600,7 +736,7 @@ def build_dataloaders(cfg) -> Tuple[DataLoader, DataLoader]:
         val_ds,
         batch_size=cfg.train.batch_size * 2,         # val bisa batch lebih besar (no grad)
         shuffle=False,
-        num_workers=cfg.data.dataloader_num_workers,
+        num_workers=_n_workers,
         pin_memory=cfg.data.pin_memory,
         prefetch_factor=cfg.data.prefetch_factor,
         collate_fn=collate_fn,
