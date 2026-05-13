@@ -71,6 +71,7 @@ def evaluate_on_mockrobiota(
 
     device = torch.device(device)
     model.eval()
+    _raw_model = model.module if isinstance(model, torch.nn.DataParallel) else model
 
     RANK_NAMES = label_enc.ranks  # ["Phylum", "Class", ..., "Species"]
 
@@ -102,7 +103,7 @@ def evaluate_on_mockrobiota(
             attention_mask = enc["attention_mask"].to(device)
 
             with torch.no_grad():
-                results = model.predict_with_abstention(
+                results = _raw_model.predict_with_abstention(
                     input_ids,
                     attention_mask,
                     conf_thresholds=conf_thresholds,
@@ -268,25 +269,25 @@ def run_ablation_study(
     edge_index: Tensor,
     leaf_node_ids: Optional[Tensor] = None,
     variants: Optional[List[dict]] = None,
-    n_epochs_ablation: int = 5,
+    n_epochs: int = 5,
 ) -> "pd.DataFrame":
     """
     Jalankan ablation study untuk membandingkan varian arsitektur.
 
-    Setiap varian dilatih untuk n_epochs_ablation epoch; validasi pada val_dl.
+    Setiap varian dilatih untuk n_epochs epoch; validasi pada val_dl.
     Metrik utama: F1-macro, F1-Species.
 
     Parameter:
-        cfg              : Config object
-        train_dl         : DataLoader training
-        val_dl           : DataLoader validasi
-        label_enc        : HierarchicalLabelEncoder
-        edge_index       : taxonomy graph edges
-        leaf_node_ids    : Species-level leaf node IDs
-        variants         : list of dict, setiap dict berisi override config model
-                           Contoh: [{"name": "no_hgnn", "use_hgnn": False}, ...]
-                           Default: suite ablasi standar dari paper
-        n_epochs_ablation: jumlah epoch per varian (5 cukup untuk perbandingan)
+        cfg          : Config object
+        train_dl     : DataLoader training
+        val_dl       : DataLoader validasi
+        label_enc    : HierarchicalLabelEncoder
+        edge_index   : taxonomy graph edges
+        leaf_node_ids: Species-level leaf node IDs
+        variants     : list of dict, setiap dict berisi override config model
+                       Contoh: [{"name": "no_hgnn", "use_hgnn": False}, ...]
+                       Default: suite ablasi standar dari paper
+        n_epochs     : jumlah epoch per varian (5 cukup untuk perbandingan)
 
     Return:
         DataFrame dengan kolom: variant, f1_macro, f1_species, f1_genus,
@@ -329,7 +330,7 @@ def run_ablation_study(
             continue
 
         # Train singkat
-        trainer = Trainer(model, cfg_copy, train_dl, val_dl, label_enc)
+        trainer = Trainer(model, train_dl, val_dl, cfg_copy)
         trainer.setup_optimizers()
 
         best_f1_macro   = 0.0
@@ -338,9 +339,9 @@ def run_ablation_study(
         best_f1_phylum  = 0.0
         best_epoch      = 0
 
-        for epoch in range(1, n_epochs_ablation + 1):
-            trainer._run_train_epoch(epoch)
-            val_metrics = trainer._run_val_epoch(epoch)
+        for epoch in range(1, n_epochs + 1):
+            trainer._train_one_epoch(epoch)
+            val_metrics = trainer._validate(epoch)
 
             macro = val_metrics.get("f1_macro", 0.0)
             if macro > best_f1_macro:

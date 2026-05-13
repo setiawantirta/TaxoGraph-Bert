@@ -400,6 +400,14 @@ class Trainer:
         for epoch in epoch_pbar:
             t_start = time.time()
 
+            # Pre-komputasi node embeddings HyTaxGNN sekali per epoch
+            # (menghindari re-komputasi 17k× di dalam _train_one_epoch per batch)
+            with torch.no_grad():
+                _node_emb = self._raw_model.hytaxgnn(
+                    self._raw_model.edge_index
+                ).detach()
+            self._raw_model._node_emb_cache = _node_emb
+
             # Training
             train_metrics = self._train_one_epoch(epoch)
 
@@ -502,7 +510,7 @@ class Trainer:
             _amp_dt = self.device.type if self.device.type in ('cuda', 'cpu') else 'cpu'
             _amp_en = tcfg.use_amp and self.device.type == 'cuda'
             with autocast(device_type=_amp_dt, enabled=_amp_en):
-                out    = self.model(input_ids, attention_mask)
+                out    = self.model(input_ids, attention_mask, update_graph=False)
                 logits = out["logits"]
                 loss, loss_dict = self.criterion(logits, labels)
                 loss = loss / accumulate  # normalize untuk gradient accumulation

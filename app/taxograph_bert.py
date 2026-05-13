@@ -659,8 +659,9 @@ class TaxoGraphBERT(nn.Module):
         # Simpan leaf_node_ids (Species-level) sebagai buffer untuk OOD detection
         self.register_buffer("leaf_node_ids", leaf_node_ids)
 
-        # Cache node embeddings (di-update setiap epoch Phase 1, frozen setelahnya)
-        self._node_emb_cache: Optional[Tensor] = None
+        # Cache node embeddings — registered as non-persistent buffer so DataParallel
+        # broadcasts it to each GPU replica correctly (avoids cross-device tensor references).
+        self.register_buffer("_node_emb_cache", None, persistent=False)
 
     @property
     def device(self) -> torch.device:
