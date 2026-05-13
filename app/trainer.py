@@ -535,6 +535,9 @@ class Trainer:
                 loss   = F.relu(d_pos - d_neg + margin)
 
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self._raw_model.hytaxgnn.parameters(), max_norm=1.0
+                )
                 optimizer_p1.step()
 
                 pbar.set_postfix({"loss": f"{loss.item():.4f}",
