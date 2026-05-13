@@ -141,8 +141,19 @@ class TrainConfig:
     # Batch & accumulation
     batch_size: int = 32                         # per-GPU batch size
     gradient_accumulation_steps: int = 8        # effective batch = 32 × 8 = 256
-    max_epochs: int = 100
+    max_epochs: int = 200                        # batas atas epoch — safety cap
     early_stopping_patience: int = 10           # stop jika val F1 tidak naik N epoch
+    early_stopping_min_delta: float = 1e-4      # improvement minimum agar patience di-reset
+
+    # Plateau mitigation — LR reduction saat F1 datar
+    plateau_patience: int = 5                    # kurangi LR setelah N epoch stagnan (< early_stopping_patience)
+    plateau_lr_factor: float = 0.5               # LR = LR × factor per plateau event
+    plateau_lr_min: float = 1e-7                 # floor LR (tidak turun lebih rendah dari ini)
+
+    # Saddle point escape — Gaussian noise + LR spike + scheduler restart
+    # PENTING: noise hanya untuk param Euclidean; HyTaxGNN (Poincaré) pakai LR spike 5× saja
+    saddle_escape_patience: int = 8              # aktifkan setelah N epoch stagnan (plateau < saddle < early_stop)
+    saddle_escape_noise_std: float = 1e-4        # std noise Gaussian (param Euclidean saja)
 
     # Optimizer — Transformer backbone
     lr_transformer: float = 3e-5

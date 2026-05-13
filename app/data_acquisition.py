@@ -103,13 +103,19 @@ def download_mockrobiota(
     return downloaded
 
 
-def load_mockrobiota_dataset(mock_dir: str | Path, mock_id: int) -> dict:
+def load_mockrobiota_dataset(
+    mock_dir: str | Path,
+    mock_id: int,
+    max_reads: int | None = 2000,
+) -> dict:
     """
     Muat satu dataset mockrobiota dari folder lokal.
 
     Parameter:
-        mock_dir : direktori root mockrobiota (sama dengan `output_dir` di download_mockrobiota)
-        mock_id  : ID dataset mockrobiota (misal: 1, 2, 3, ...)
+        mock_dir  : direktori root mockrobiota (sama dengan `output_dir` di download_mockrobiota)
+        mock_id   : ID dataset mockrobiota (misal: 1, 2, 3, ...)
+        max_reads : batas jumlah reads yang dimuat ke RAM (default 2000).
+                    None = tidak ada batas (hati-hati: bisa OOM untuk dataset besar).
 
     Return:
         dict dengan key:
@@ -129,14 +135,19 @@ def load_mockrobiota_dataset(mock_dir: str | Path, mock_id: int) -> dict:
             "Jalankan download_mockrobiota() terlebih dahulu."
         )
 
-    # Baca sekuens dari FASTQ (ambil setiap baris ke-2 = sequence line)
+    # Baca sekuens dari FASTQ secara streaming (1 baris per iterasi → O(1) memori)
+    # FASTQ format: setiap record = 4 baris; baris ke-2 (index 1) = sequence
     sequences = []
     with open(fastq_path, "r", errors="replace") as fh:
-        lines = fh.readlines()
-    for i in range(1, len(lines), 4):  # baris 1, 5, 9, ... = sequence
-        seq = lines[i].strip()
-        if seq:
-            sequences.append(seq)
+        line_num = 0
+        for line in fh:
+            if line_num % 4 == 1:  # baris sequence dalam record FASTQ
+                seq = line.strip()
+                if seq:
+                    sequences.append(seq)
+                    if max_reads is not None and len(sequences) >= max_reads:
+                        break
+            line_num += 1
 
     # Baca expected taxonomy
     taxonomy = []
@@ -318,8 +329,9 @@ def _download_and_decompress(
     dest: Path,
     retry: int = 3,
     delay: float = 2.0,
+    chunk_size: int = 65536,
 ) -> None:
-    """Unduh file .gz dan decompress ke dest."""
+    """Unduh file .gz dan decompress ke dest secara streaming (chunk-by-chunk)."""
     for attempt in range(1, retry + 1):
         try:
             logger.info(f"Mengunduh+decompress ({attempt}/{retry}): {url}")
@@ -328,12 +340,19 @@ def _download_and_decompress(
                 headers={"User-Agent": "taxograph-bert/1.0 data-acquisition"},
             )
             with urllib.request.urlopen(req, timeout=300) as resp:
-                gz_data = resp.read()
-            decompressed = gzip.decompress(gz_data)
-            dest.write_bytes(decompressed)
+                with gzip.open(resp, "rb") as gz_stream:
+                    with open(dest, "wb") as out_fh:
+                        while True:
+                            chunk = gz_stream.read(chunk_size)
+                            if not chunk:
+                                break
+                            out_fh.write(chunk)
             return
         except Exception as exc:
             logger.warning(f"Gagal download+decompress {url}: {exc}")
+            # Hapus file partial agar tidak terpakai pada percobaan berikutnya
+            if dest.exists():
+                dest.unlink()
             if attempt < retry:
                 time.sleep(delay)
     raise RuntimeError(f"Gagal mengunduh setelah {retry} percobaan: {url}")

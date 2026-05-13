@@ -36,6 +36,7 @@ def evaluate_on_mockrobiota(
     device: str | torch.device = "cpu",
     mock_ids: Optional[List[int]] = None,
     conf_thresholds: Optional[Dict[str, float]] = None,
+    max_reads_per_mock: int = 2000,
 ) -> "pd.DataFrame":
     """
     Evaluasi TaxoGraphBERT pada seluruh dataset Mockrobiota.
@@ -79,7 +80,7 @@ def evaluate_on_mockrobiota(
 
     for mid in mock_ids:
         try:
-            data = load_mockrobiota_dataset(mock_dir, mid)
+            data = load_mockrobiota_dataset(mock_dir, mid, max_reads=max_reads_per_mock)
         except FileNotFoundError as exc:
             logger.warning(f"[mockrobiota] mock-{mid} tidak ditemukan: {exc}")
             continue
@@ -114,6 +115,10 @@ def evaluate_on_mockrobiota(
                 all_preds.append(r["predictions"])
                 if r["abstain_rank"] is not None:
                     abstain_count += 1
+
+            del input_ids, attention_mask
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
         n_samples    = len(sequences)
         abstain_rate = abstain_count / max(n_samples, 1)
@@ -506,6 +511,9 @@ def _collect_ood_scores(model, dataloader: DataLoader, device: torch.device) -> 
         attention_mask = batch["attention_mask"].to(device)
         out = model(input_ids, attention_mask, update_graph=False)
         scores_list.append(out["ood_score"].cpu().numpy())
+        del input_ids, attention_mask
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
     return np.concatenate(scores_list) if scores_list else np.array([])
 
 
@@ -706,25 +714,36 @@ def run_encoder_comparison(
 def _collect_ood_scores_from_fasta(
     model, tokenizer, fasta_path: str | Path, device: torch.device, batch_size: int = 32
 ) -> np.ndarray:
-    """Kumpulkan skor OOD dari file FASTA (untuk evaluasi OOD hold-out)."""
+    """Kumpulkan skor OOD dari file FASTA secara streaming (tidak load semua sekuens ke RAM)."""
     try:
         from Bio import SeqIO
     except ImportError:
         logger.error("Biopython diperlukan: pip install biopython")
         return np.array([])
 
-    sequences = [str(r.seq).upper() for r in SeqIO.parse(str(fasta_path), "fasta")]
-    if not sequences:
-        return np.array([])
-
     scores_list = []
-    for i in range(0, len(sequences), batch_size):
-        batch_seqs = sequences[i: i + batch_size]
-        enc = tokenizer.batch_encode(batch_seqs)
+    batch_seqs: list[str] = []
+
+    def _flush(seqs: list[str]) -> None:
+        """Forward pass satu batch dan simpan skor OOD."""
+        enc = tokenizer.batch_encode(seqs)
         input_ids      = enc["input_ids"].to(device)
         attention_mask = enc["attention_mask"].to(device)
         out = model(input_ids, attention_mask, update_graph=False)
         scores_list.append(out["ood_score"].cpu().numpy())
+        del input_ids, attention_mask
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    # Streaming: SeqIO.parse() adalah generator — tidak load seluruh file ke RAM
+    for record in SeqIO.parse(str(fasta_path), "fasta"):
+        batch_seqs.append(str(record.seq).upper())
+        if len(batch_seqs) >= batch_size:
+            _flush(batch_seqs)
+            batch_seqs = []
+
+    if batch_seqs:  # flush sisa batch terakhir
+        _flush(batch_seqs)
 
     return np.concatenate(scores_list) if scores_list else np.array([])
 

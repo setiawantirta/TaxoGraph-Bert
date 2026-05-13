@@ -187,6 +187,9 @@ class Trainer:
         self.patience_ctr  = 0
         self.global_step   = 0
         self.epoch_metrics: List[Dict] = []
+        self._plateau_lr_reductions  = 0      # jumlah reduksi LR akibat plateau
+        self._hgnn_lr_spike_active   = False  # flag LR spike HyTaxGNN sedang aktif
+        self._hgnn_lr_before_spike   = None   # simpan LR HGNN sebelum spike
 
         # ── CSV backup ─────────────────────────────────────────────────
         _suffix = f"_{run_tag}" if run_tag else ""
@@ -223,6 +226,103 @@ class Trainer:
         with open(self.csv_path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=row.keys())
             writer.writerow(row)
+
+    # ── Plateau & Saddle Mitigation ────────────────────────────────────────
+
+    def _reduce_lr_on_plateau(self):
+        """
+        Kurangi learning rate semua param_groups saat plateau terdeteksi.
+        LR baru = max(LR × factor, plateau_lr_min).
+        Tidak memengaruhi scheduler internal — hanya override param_group['lr'] langsung.
+        """
+        tcfg   = self.cfg.train
+        factor = tcfg.plateau_lr_factor
+        lr_min = tcfg.plateau_lr_min
+
+        new_lrs = []
+        for pg in self.optimizer.param_groups:
+            old_lr = pg["lr"]
+            new_lr = max(old_lr * factor, lr_min)
+            pg["lr"] = new_lr
+            new_lrs.append(f"{old_lr:.2e}→{new_lr:.2e}")
+
+        self._plateau_lr_reductions += 1
+        logger.warning(
+            f"[plateau] LR dikurangi (reduksi ke-{self._plateau_lr_reductions}): "
+            + ", ".join(new_lrs)
+        )
+
+    def _escape_saddle_point(self):
+        """
+        Coba keluar dari saddle point:
+
+        1. Euclidean params (seq_encoder, fusion, classifier, ood_head):
+           Tambahkan Gaussian noise kecil ke bobot.
+           Aman karena tidak ada constraint manifold.
+
+        2. HyTaxGNN params (Poincaré ball — manifold-constrained):
+           JANGAN noise langsung (bisa push ‖x‖ ≥ 1/√c → NaN).
+           Sebagai gantinya, naikkan LR HGNN sementara 5× (spike).
+           RiemannianSGD dari geoopt menjaga constraint bola secara implisit.
+
+        3. Scheduler: reset CosineAnnealingWarmRestarts cycle ke T_cur=0
+           sehingga LR naik kembali dari eta_max → efek restart yang manifold-safe.
+        """
+        tcfg      = self.cfg.train
+        noise_std = tcfg.saddle_escape_noise_std
+
+        # Identifikasi submodul Euclidean vs hiperbolik
+        euclidean_submodules = ["seq_encoder", "fusion", "classifier", "ood_head"]
+        hyperbolic_submodules = ["hytaxgnn"]
+
+        # 1. Gaussian noise ke param Euclidean
+        n_perturbed = 0
+        for name in euclidean_submodules:
+            submod = getattr(self._raw_model, name, None)
+            if submod is None:
+                continue
+            for p in submod.parameters():
+                if p.requires_grad and p.data.is_floating_point():
+                    p.data.add_(torch.randn_like(p.data) * noise_std)
+                    n_perturbed += p.numel()
+        logger.warning(
+            f"[saddle_escape] Gaussian noise (std={noise_std}) diterapkan ke "
+            f"{n_perturbed:,} Euclidean parameter."
+        )
+
+        # 2. LR spike 5× untuk HyTaxGNN (hanya param_group yang mengandung hytaxgnn params)
+        hgnn_param_ids = {
+            id(p) for p in self._raw_model.hytaxgnn.parameters()
+        } if hasattr(self._raw_model, "hytaxgnn") else set()
+
+        if hgnn_param_ids:
+            self._hgnn_lr_before_spike = []
+            for pg in self.optimizer.param_groups:
+                pg_param_ids = {id(p) for p in pg["params"]}
+                if pg_param_ids & hgnn_param_ids:  # interseksi: ini adalah group HGNN
+                    old_lr = pg["lr"]
+                    pg["lr"] = old_lr * 5.0
+                    self._hgnn_lr_before_spike.append((pg, old_lr))
+                    logger.warning(
+                        f"[saddle_escape] HyTaxGNN LR spike: {old_lr:.2e} → {pg['lr']:.2e} "
+                        f"(akan dikembalikan setelah 1 epoch)"
+                    )
+            self._hgnn_lr_spike_active = True
+
+        # 3. Reset scheduler cosine cycle ke T_cur = 0
+        if hasattr(self.scheduler, "last_epoch"):
+            self.scheduler.last_epoch = 0
+            logger.warning("[saddle_escape] Cosine scheduler di-reset ke T_cur=0 (restart cycle).")
+
+    def _restore_hgnn_lr_after_spike(self):
+        """Kembalikan LR HyTaxGNN ke nilai sebelum spike. Dipanggil 1 epoch setelah spike."""
+        if not self._hgnn_lr_spike_active:
+            return
+        for pg, old_lr in (self._hgnn_lr_before_spike or []):
+            pg["lr"] = old_lr
+            logger.info(f"[saddle_escape] HyTaxGNN LR dikembalikan: {pg['lr']:.2e} → {old_lr:.2e}")
+        self._hgnn_lr_spike_active  = False
+        self._hgnn_lr_before_spike  = None
 
     # ── PHASE 1: Pre-training HyTaxGNN ────────────────────────────────────
     def phase1_pretrain_hgnn(self):
@@ -444,28 +544,56 @@ class Trainer:
             self.epoch_metrics.append(train_row)
             self.epoch_metrics.append(val_row)
 
-            # Update progress bar
-            epoch_pbar.set_postfix({
-                "val_f1_genus":   f"{val_metrics.get('f1_Genus', 0):.4f}",
-                "val_f1_species": f"{val_metrics.get('f1_Species', 0):.4f}",
-                "loss":           f"{train_metrics.get('loss_total', 0):.4f}",
-            })
+            # Kembalikan LR HyTaxGNN jika spike aktif dari epoch sebelumnya
+            self._restore_hgnn_lr_after_spike()
 
-            # Early stopping & checkpointing
-            val_f1 = val_metrics.get("f1_macro", 0)
-            if val_f1 > self.best_val_f1:
-                self.best_val_f1 = val_f1
+            # Early stopping & checkpointing (dengan cascade plateau → saddle → stop)
+            val_f1    = val_metrics.get("f1_macro", 0)
+            min_delta = getattr(tcfg, "early_stopping_min_delta", 1e-4)
+
+            if val_f1 > self.best_val_f1 + min_delta:
+                self.best_val_f1  = val_f1
                 self.patience_ctr = 0
                 self._save_checkpoint(epoch, "best")
                 logger.info(f"Epoch {epoch}: NEW BEST val F1 = {val_f1:.4f} → checkpoint disimpan")
             else:
                 self.patience_ctr += 1
+
+                # ── Cascade: Plateau → Saddle Escape → Early Stop ────────────
+                plateau_p = getattr(tcfg, "plateau_patience", 5)
+                saddle_p  = getattr(tcfg, "saddle_escape_patience", 8)
+
+                if self.patience_ctr == plateau_p:
+                    logger.warning(
+                        f"Epoch {epoch}: Plateau terdeteksi ({plateau_p} epoch stagnan) "
+                        f"→ mengurangi LR."
+                    )
+                    self._reduce_lr_on_plateau()
+
+                elif self.patience_ctr == saddle_p:
+                    logger.warning(
+                        f"Epoch {epoch}: Kemungkinan saddle point ({saddle_p} epoch stagnan) "
+                        f"→ perturbasi Euclidean + LR spike HyTaxGNN + scheduler restart."
+                    )
+                    self._escape_saddle_point()
+
                 if self.patience_ctr >= tcfg.early_stopping_patience:
-                    logger.info(f"Early stopping triggered setelah {epoch} epoch.")
+                    logger.info(
+                        f"Early stopping triggered setelah {epoch} epoch "
+                        f"({self.patience_ctr} epoch tanpa improvement ≥ {min_delta})."
+                    )
                     break
 
             # Selalu simpan checkpoint terbaru
             self._save_checkpoint(epoch, "latest")
+
+            # Update postfix dengan info patience untuk monitoring
+            epoch_pbar.set_postfix({
+                "val_f1_genus":   f"{val_metrics.get('f1_Genus', 0):.4f}",
+                "val_f1_species": f"{val_metrics.get('f1_Species', 0):.4f}",
+                "loss":           f"{train_metrics.get('loss_total', 0):.4f}",
+                "pat":            f"{self.patience_ctr}/{tcfg.early_stopping_patience}",
+            })
 
         # Tandai training selesai (digunakan saat simpan _latest checkpoint terakhir)
         self._training_complete = True
