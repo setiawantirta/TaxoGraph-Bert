@@ -181,6 +181,18 @@ class TrainConfig:
         0.5, 0.6, 0.7, 0.8, 1.0, 1.2           # Phylum → Species (makin halus makin besar)
     ])
 
+    # Loss type — pilih strategi loss untuk Phase 2
+    # "weighted" : CE biasa × rank_weights (perilaku lama, backward-compatible)
+    # "focal"    : Focal Loss per rank — down-weight easy samples, fokus kelas langka (DEFAULT)
+    # "hybrid"   : Focal Loss × rank_weights — kombinasi keduanya
+    loss_type: str = "focal"
+
+    # Focal gamma per rank — (1-p_t)^gamma; makin besar makin agresif ke sampel sulit
+    # Phylum sudah mudah (gamma kecil); Species sulit (gamma besar → anti mode-collapse)
+    focal_gamma: List[float] = field(default_factory=lambda: [
+        0.5, 0.5, 1.0, 1.0, 1.5, 2.0           # Phylum → Species
+    ])
+
     # Regularisasi
     label_smoothing: float = 0.05               # mencegah overconfidence
     max_grad_norm: float = 1.0                  # gradient clipping

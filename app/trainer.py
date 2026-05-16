@@ -51,53 +51,98 @@ except ImportError:
 
 class HierarchicalCrossEntropyLoss(nn.Module):
     """
-    Hierarchical Cross-Entropy Loss dengan penalti eksponensial lintas rank.
+    Hierarchical Loss dengan tiga mode yang dapat dipilih via `loss_type`:
 
-    Formula:
-      L = Σ_r w_r · CE(ŷ_r, y_r) + γ · Σ_r Σ_{r'>r} exp(rank_gap) · 1[ŷ_r ≠ y_r]
+    - "weighted" : CE biasa × rank_weight (perilaku lama, backward-compatible)
+    - "focal"    : Focal Loss per rank — down-weight easy samples, fokus kelas langka
+    - "hybrid"   : Focal Loss × rank_weight — kombinasi keduanya
 
-    - w_r       : bobot per rank (lebih besar untuk rank lebih halus)
-    - γ         : skala penalti lintas rank
-    - rank_gap  : jarak antar rank yang salah (1=dalam order, 5=lintas phylum)
-    - label_smoothing: mencegah overconfidence
+    Formula Focal Loss (per sampel):
+        FL(p_t) = -(1 - p_t)^γ · log(p_t)
+        p_t = softmax(logits)[y_true]
+
+    Semakin tinggi confidence model (sampel mudah) → (1-p_t)^γ → 0 → loss ≈ 0
+    Semakin rendah confidence (kelas langka) → (1-p_t)^γ → 1 → loss ≈ CE
 
     Parameter:
-        rank_weights    : list bobot per rank (Phylum → Species)
-        gamma           : skala penalti cross-rank
-        label_smoothing : epsilon label smoothing
-        ignore_index    : index label yang diabaikan (0 = PAD)
+        loss_type    : "weighted" | "focal" | "hybrid"
+        rank_weights : bobot per rank (aktif di "weighted" dan "hybrid")
+        focal_gamma  : γ per rank untuk focal modulation
+        gamma        : skala penalti cross-rank hierarkis
+        label_smoothing : mencegah overconfidence
+        ignore_index : index label yang diabaikan (0 = PAD)
 
     Input:
         logits_list : list of 6 tensor (B, C_rank) — logits per rank
         labels      : (B, 6) int64 — ground truth index per rank
 
     Return:
-        scalar loss tensor
+        (total_loss tensor, loss_dict) — loss total dan breakdown per rank
     """
 
     def __init__(
         self,
+        loss_type: str = "focal",
         rank_weights: List[float] = None,
+        focal_gamma: List[float] = None,
         gamma: float = 0.1,
         label_smoothing: float = 0.05,
         ignore_index: int = 0,
     ):
         super().__init__()
+        if loss_type not in ("weighted", "focal", "hybrid"):
+            raise ValueError(
+                f"loss_type harus 'weighted', 'focal', atau 'hybrid', dapat: {loss_type!r}"
+            )
+        self.loss_type       = loss_type
         self.rank_weights    = rank_weights or [0.5, 0.6, 0.7, 0.8, 1.0, 1.2]
+        self.focal_gamma     = focal_gamma  or [0.5, 0.5, 1.0, 1.0, 1.5, 2.0]
         self.gamma           = gamma
         self.label_smoothing = label_smoothing
         self.ignore_index    = ignore_index
         self.n_ranks         = len(self.rank_weights)
 
-        # CE loss per rank (tanpa reduction agar bisa di-mask)
-        self.ce_losses = nn.ModuleList([
-            nn.CrossEntropyLoss(
-                label_smoothing=label_smoothing,
-                ignore_index=ignore_index,
-                reduction="mean",
-            )
-            for _ in range(self.n_ranks)
-        ])
+    def _focal_loss(self, logits: Tensor, targets: Tensor, gamma: float) -> Tensor:
+        """
+        Multi-class Focal Loss dengan label smoothing dan ignore_index.
+
+        Alur:
+          1. CE per-sampel (reduction='none') dengan label_smoothing
+          2. p_t = softmax(logits)[y_true] — confidence di kelas yang benar
+          3. focal_weight = (1 - p_t)^gamma  (no_grad — hanya modulator)
+          4. loss = mean(focal_weight * ce) hanya pada sampel valid
+
+        Note: p_t dihitung dari softmax asli (bukan smoothed) agar focal
+        weighting mencerminkan confidence nyata model.
+        """
+        valid_mask = targets != self.ignore_index
+
+        # CE per sampel (dengan label_smoothing; ignore_index → 0 untuk sampel invalid)
+        ce_per_sample = F.cross_entropy(
+            logits,
+            targets,
+            ignore_index=self.ignore_index,
+            label_smoothing=self.label_smoothing,
+            reduction="none",
+        )  # (B,)
+
+        if gamma == 0.0:
+            # Degenerasi ke CE biasa
+            n_valid = valid_mask.float().sum().clamp(min=1.0)
+            return ce_per_sample.sum() / n_valid
+
+        # Hitung p_t — tanpa gradient (hanya bobot, bukan bagian dari komputasi loss)
+        with torch.no_grad():
+            probs      = F.softmax(logits.float(), dim=-1)               # (B, C)
+            safe_tgt   = targets.clamp(min=0)                            # hindari index negatif
+            p_t        = probs.gather(1, safe_tgt.unsqueeze(1)).squeeze(1)  # (B,)
+            p_t        = p_t * valid_mask.float()                        # 0 untuk PAD
+
+        focal_weight    = (1.0 - p_t) ** gamma     # (B,)
+        loss_per_sample = focal_weight * ce_per_sample  # (B,)
+
+        n_valid = valid_mask.float().sum().clamp(min=1.0)
+        return loss_per_sample.sum() / n_valid
 
     def forward(
         self, logits_list: List[Tensor], labels: Tensor
@@ -109,27 +154,33 @@ class HierarchicalCrossEntropyLoss(nn.Module):
         total_loss = torch.tensor(0.0, device=labels.device, requires_grad=True)
         loss_dict  = {}
 
-        for r, (logits, w, ce_fn) in enumerate(
-            zip(logits_list, self.rank_weights, self.ce_losses)
-        ):
-            y_r = labels[:, r]  # (B,)
+        for r, logits in enumerate(logits_list):
+            y_r = labels[:, r]          # (B,)
+            w   = self.rank_weights[r]
+            fg  = self.focal_gamma[r]
 
-            # CE loss untuk rank ini
-            loss_r = w * ce_fn(logits, y_r)
+            if self.loss_type == "weighted":
+                # Mode lama: CE × rank_weight
+                loss_r = w * F.cross_entropy(
+                    logits, y_r,
+                    ignore_index=self.ignore_index,
+                    label_smoothing=self.label_smoothing,
+                    reduction="mean",
+                )
+            elif self.loss_type == "focal":
+                # Focal Loss — rank_weights diabaikan, focal_gamma yang aktif
+                loss_r = self._focal_loss(logits, y_r, gamma=fg)
+            else:  # "hybrid"
+                # Focal Loss × rank_weight — kedua mekanisme aktif
+                loss_r = w * self._focal_loss(logits, y_r, gamma=fg)
 
-            # Penalti cross-rank: jika salah di rank r, cek apakah prediksi
-            # juga salah di rank yang lebih kasar (indikatif kesalahan parah)
-            pred_r = logits.argmax(dim=-1)  # (B,)
-            wrong  = (pred_r != y_r) & (y_r != self.ignore_index)  # (B,) bool
-
+            # Penalti cross-rank hierarkis (sama untuk semua mode)
+            pred_r = logits.argmax(dim=-1)
+            wrong  = (pred_r != y_r) & (y_r != self.ignore_index)
             if wrong.any() and r > 0:
-                # Penalti hierarkis: kesalahan di rank LEBIH KASAR lebih dipenalti
-                # rank_distance = jarak dari rank tertinggi (Phylum=0) ke rank saat ini
-                # Phylum error (r=0) → exp(n_ranks-0) = max penalty
-                # Species error (r=5) → exp(n_ranks-5) = min penalty
-                rank_distance  = self.n_ranks - r  # lebih besar = rank lebih kasar
-                cross_penalty  = self.gamma * torch.exp(
-                    torch.tensor(float(rank_distance))
+                rank_distance = self.n_ranks - r
+                cross_penalty = self.gamma * torch.exp(
+                    torch.tensor(float(rank_distance), device=labels.device)
                 ) * wrong.float().mean()
                 loss_r = loss_r + cross_penalty
 
@@ -178,7 +229,9 @@ class Trainer:
 
         # ── Loss ───────────────────────────────────────────────────────
         self.criterion = HierarchicalCrossEntropyLoss(
+            loss_type=getattr(cfg.train, "loss_type", "focal"),
             rank_weights=cfg.train.rank_weights,
+            focal_gamma=getattr(cfg.train, "focal_gamma", [0.5, 0.5, 1.0, 1.0, 1.5, 2.0]),
             gamma=cfg.train.hierarchical_penalty_gamma,
             label_smoothing=cfg.train.label_smoothing,
         )
@@ -700,7 +753,7 @@ class Trainer:
                 "epoch":      epoch,
                 "phase":      "val",
                 "loss_total": val_loss,
-                **{f"loss_rank_{r}": 0.0 for r in range(6)},
+                **{f"loss_rank_{r}": val_metrics.get(f"loss_rank_{r}", 0.0) for r in range(6)},
                 **{f"f1_{rn}": val_metrics.get(f"f1_{rn}", 0) for rn in self.RANK_NAMES},
                 "f1_macro":   val_f1,
                 "lr":         current_lr,
@@ -904,8 +957,9 @@ class Trainer:
         all_preds  = [[] for _ in range(6)]  # prediksi per rank
         all_labels = [[] for _ in range(6)]  # label benar per rank
 
-        total_val_loss = 0.0
-        n_val_batches  = 0
+        total_val_loss  = 0.0
+        rank_val_losses = {f"loss_rank_{r}": 0.0 for r in range(6)}
+        n_val_batches   = 0
 
         pbar = tqdm(
             self.val_dl,
@@ -923,10 +977,12 @@ class Trainer:
             out    = self.model(input_ids, attention_mask, update_graph=False)
             logits = out["logits"]
 
-            # Hitung val loss
+            # Hitung val loss total dan per rank
             labels_dev = labels.to(self.device)
             _, loss_d  = self.criterion(logits, labels_dev)
             total_val_loss += loss_d["loss_total"]
+            for r in range(6):
+                rank_val_losses[f"loss_rank_{r}"] += loss_d.get(f"loss_rank_{r}", 0.0)
             n_val_batches  += 1
 
             for r in range(6):
@@ -952,8 +1008,11 @@ class Trainer:
             f1_values.append(f1)
             logger.debug(f"    F1 {rname}: {f1:.4f}")
 
+        n_batches_safe = max(n_val_batches, 1)
         metrics["f1_macro"] = float(np.mean(f1_values)) if f1_values else 0.0
-        metrics["val_loss"] = total_val_loss / max(n_val_batches, 1)
+        metrics["val_loss"] = total_val_loss / n_batches_safe
+        for r in range(6):
+            metrics[f"loss_rank_{r}"] = rank_val_losses[f"loss_rank_{r}"] / n_batches_safe
         return metrics
 
     # ── Checkpointing ─────────────────────────────────────────────────────

@@ -38,4 +38,8 @@ Gagal download+decompress https://s3-us-west-2.amazonaws.com/mockrobiota/latest/
 apakah karena ukuran filenya sangat besar, saya cek file fastq.qz 10gb.
 apakah jika saya download manual akan menjadi solusi?
 
-7. 
+=======================================================================================================================================================================================================
+
+1. Melihat level spesies memiliki nilai f1 macro yang sangat pelan perbaikannya, disarankan menggunakan Focal Loss
+2. hitung juga Validasi loss_rank_0, loss_rank_1, loss_rank_2, loss_rank_3, loss_rank_4, loss_rank_5 dan tamahkan ke dalam log csv
+3. apakah kode sudah memanfaatkan nn.parallel.DistributedDataParallel (DDP)
