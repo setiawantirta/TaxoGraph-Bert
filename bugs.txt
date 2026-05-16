@@ -1,0 +1,41 @@
+1. file: /kaggle/working/outputs/metrics/taxograph_bert_v1_train_log.csv, misal kita sudah berhasil running epoch 1 - 7 lalu berhenti karena sesion Kaggle berhenti. Ketika dirun ulang, nilai epoch 1-7 hilang dan di restart dengan nilai epoch 8 dan seterusnya. sehingga saya kehilangan nilai epoch 1-7. harus file lama tidak di hapus akan lebih baik di append saja.
+
+2. nilai Norm rata-rata dan  Norm max ini juika saya running berkali kali maka nilainya berubah ubah terus:
+HyTaxGNN output shape: torch.Size([7954, 128])
+  Norm rata-rata : 0.0001  (harus < 1/√c = 1.00)
+  Norm max       : 0.0003
+perubahan ini juga membuat Fig. 6 hyperbolic taxonomy graph - node embeddings juga berubah. Phylum jadi tidak berada di depan mendekati 0 tetapi berada di paling belakang setelah genus dan spesies. apakah normal?
+
+3. kenapa pada fig 7. Kurva Training TaxoGraph-BERT pada plot B nilai Train f1-macro tidak ada atau 0, apakah memng seperti iyu atau memang tidak dihitung nilainya atau salah nama kolomnya?
+
+4. ketika running kode untuk produksi Fig 9: Reliability diagram (ECE kalibrasi), muncul error berikut
+---------------------------------------------------------------------------
+NameError                                 Traceback (most recent call last)
+/tmp/ipykernel_57/3949576638.py in <cell line: 0>()
+      4 
+      5 # build_model already calls model.to(cfg.device) internally
+----> 6 model = build_model(cfg, label_enc, edge_index, leaf_node_ids)
+      7 
+      8 model.eval()
+
+NameError: name 'build_model' is not defined
+
+5. ketika running kode unutk produksi Fig 10: Confusion matrix — Phylum, Genus, Species (top-K classes), muncul error berikut:
+---------------------------------------------------------------------------
+NameError                                 Traceback (most recent call last)
+/tmp/ipykernel_57/1523396695.py in <cell line: 0>()
+      9     y_true_all, y_pred_all = [], []
+     10     with torch.no_grad():
+---> 11         for batch in val_dl:
+     12             ids  = batch["input_ids"].to(DEVICE)
+     13             mask = batch["attention_mask"].to(DEVICE)
+
+NameError: name 'val_dl' is not defined
+
+6. ketika running kode pada 9.  Mockrobiota Benchmark (Section 4.1) muncul error berikut (saya menggunakan kaggle):
+Mengunduh dataset mockrobiota (graceful skip jika gagal)...
+Gagal download+decompress https://s3-us-west-2.amazonaws.com/mockrobiota/latest/mock-1/mock-forward-read.fastq.gz: [Errno 28] No space left on device
+apakah karena ukuran filenya sangat besar, saya cek file fastq.qz 10gb.
+apakah jika saya download manual akan menjadi solusi?
+
+7. 

@@ -10,7 +10,7 @@ src/
 *.pt
 *.pth
 *.ckpt
-*.ipynb
+#*.ipynb
 
 # Cache
 __pycache__/

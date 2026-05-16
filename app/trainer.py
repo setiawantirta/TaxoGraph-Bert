@@ -220,7 +220,10 @@ class Trainer:
         # ── CSV backup ─────────────────────────────────────────────────
         _suffix = f"_{run_tag}" if run_tag else ""
         self.csv_path = self.metric_dir / f"{cfg.experiment_name}{_suffix}_train_log.csv"
-        self._init_csv()
+        # Gunakan append=True agar file lama tidak langsung ditimpa saat Trainer
+        # di-instansiasi ulang (misal sesi Kaggle restart). File baru tetap dibuat
+        # dengan header jika belum ada. train() akan menimpa hanya jika bukan resume.
+        self._init_csv(append=True)
 
     @property
     def _raw_model(self):
@@ -687,8 +690,8 @@ class Trainer:
                 "phase":      "train",
                 "loss_total": train_metrics.get("loss_total", 0),
                 **{f"loss_rank_{r}": train_metrics.get(f"loss_rank_{r}", 0) for r in range(6)},
-                **{f"f1_{rn}": 0.0 for rn in self.RANK_NAMES},  # F1 tidak dihitung di train
-                "f1_macro":   0.0,
+                **{f"f1_{rn}": train_metrics.get(f"f1_{rn}", 0.0) for rn in self.RANK_NAMES},
+                "f1_macro":   train_metrics.get("f1_macro", 0.0),
                 "lr":         current_lr,
                 "elapsed_sec": elapsed,
             }
@@ -796,6 +799,9 @@ class Trainer:
         total_loss  = 0.0
         rank_losses = {f"loss_rank_{r}": 0.0 for r in range(6)}
         n_batches   = 0
+        # Akumulasi prediksi untuk Train F1 (tanpa forward pass tambahan)
+        all_train_preds  = [[] for _ in range(6)]
+        all_train_labels = [[] for _ in range(6)]
 
         pbar = tqdm(
             enumerate(self.train_dl),
@@ -821,6 +827,14 @@ class Trainer:
                 logits = out["logits"]
                 loss, loss_dict = self.criterion(logits, labels)
                 loss = loss / accumulate  # normalize untuk gradient accumulation
+
+            # Kumpulkan prediksi untuk Train F1 (argmax saja, tanpa forward pass tambahan)
+            for _r in range(6):
+                _pred = logits[_r].detach().argmax(dim=-1).cpu().numpy()
+                _lab  = labels[:, _r].detach().cpu().numpy()
+                _mask = _lab != 0
+                all_train_preds[_r].extend(_pred[_mask].tolist())
+                all_train_labels[_r].extend(_lab[_mask].tolist())
 
             # Backward — GradScaler hanya untuk CUDA; CPU/MPS langsung backward
             if self.device.type == 'cuda':
@@ -859,6 +873,20 @@ class Trainer:
         # Rata-rata
         avg = {"loss_total": total_loss / max(n_batches, 1)}
         avg.update({k: v / max(n_batches, 1) for k, v in rank_losses.items()})
+
+        # Hitung Train F1 per rank dari prediksi yang terakumulasi selama epoch
+        from sklearn.metrics import f1_score as _f1_fn
+        _f1_vals = []
+        for _r, _rname in enumerate(self.RANK_NAMES):
+            if len(all_train_labels[_r]) == 0:
+                avg[f"f1_{_rname}"] = 0.0
+                continue
+            avg[f"f1_{_rname}"] = float(_f1_fn(
+                all_train_labels[_r], all_train_preds[_r],
+                average="macro", zero_division=0
+            ))
+            _f1_vals.append(avg[f"f1_{_rname}"])
+        avg["f1_macro"] = float(np.mean(_f1_vals)) if _f1_vals else 0.0
         return avg
 
     @torch.no_grad()

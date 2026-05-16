@@ -49,26 +49,41 @@ def download_mockrobiota(
     mock_ids: Optional[List[int]] = None,
     retry: int = 3,
     delay: float = 2.0,
+    streaming: bool = True,
+    local_fastq_paths: Optional[dict] = None,
+    max_reads: int = 2000,
 ) -> dict[int, Path]:
     """
     Unduh dataset mockrobiota dari AWS S3.
 
     Mengunduh `mock-forward-read.fastq.gz` dan `expected-taxonomy.tsv`
-    untuk setiap dataset yang diminta. File FASTQ di-decompress ke `.fastq`.
+    untuk setiap dataset yang diminta.
 
     Parameter:
-        output_dir : direktori lokal tempat file disimpan
-                     Struktur: output_dir/mock-{N}/mock-forward-read.fastq
-                               output_dir/mock-{N}/expected-taxonomy.tsv
-        mock_ids   : list ID dataset (default: semua 16S = MOCKROBIOTA_16S_IDS)
-        retry      : jumlah percobaan ulang jika download gagal
-        delay      : jeda antar percobaan ulang (detik)
+        output_dir         : direktori lokal tempat file disimpan
+                             Struktur: output_dir/mock-{N}/mock-forward-read.fastq
+                                       output_dir/mock-{N}/expected-taxonomy.tsv
+        mock_ids           : list ID dataset (default: semua 16S = MOCKROBIOTA_16S_IDS)
+        retry              : jumlah percobaan ulang jika download gagal
+        delay              : jeda antar percobaan ulang (detik)
+        streaming          : jika True (default), streaming langsung dari URL tanpa
+                             menyimpan file .gz penuh ke disk — hemat ruang penyimpanan
+                             (file .fastq kecil ~max_reads baris yang disimpan).
+                             jika False, unduh dan decompress file penuh (~10 GB).
+        local_fastq_paths  : dict {mock_id: path} — path ke file .fastq atau .fastq.gz
+                             yang sudah diunduh manual. Jika disediakan untuk mock_id
+                             tertentu, download dari URL di-skip untuk ID tersebut.
+                             Contoh: {1: "/kaggle/input/mockrobiota/mock-1.fastq"}
+        max_reads          : jumlah reads yang disimpan saat streaming (default 2000).
+                             Tidak berpengaruh jika streaming=False atau file sudah ada.
 
     Return:
         dict {mock_id: Path} — path ke folder setiap mock dataset
     """
     if mock_ids is None:
         mock_ids = MOCKROBIOTA_16S_IDS
+    if local_fastq_paths is None:
+        local_fastq_paths = {}
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -79,14 +94,52 @@ def download_mockrobiota(
         mock_folder = output_dir / f"mock-{mid}"
         mock_folder.mkdir(parents=True, exist_ok=True)
 
-        # ── Unduh FASTQ.GZ dan decompress ───────────────────────────────────
-        fastq_gz_url  = MOCKROBIOTA_S3_BASE.format(mock_id=mid)
-        fastq_out     = mock_folder / "mock-forward-read.fastq"
+        # ── Tentukan sumber FASTQ ────────────────────────────────────────────
+        fastq_out = mock_folder / "mock-forward-read.fastq"
 
-        if not fastq_out.exists():
-            _download_and_decompress(fastq_gz_url, fastq_out, retry=retry, delay=delay)
-        else:
+        if fastq_out.exists():
             logger.info(f"[mockrobiota] mock-{mid} FASTQ sudah ada, skip download.")
+
+        elif mid in local_fastq_paths:
+            # Fallback: gunakan file yang sudah diunduh manual
+            local_path = Path(local_fastq_paths[mid])
+            if not local_path.exists():
+                raise FileNotFoundError(
+                    f"[mockrobiota] local_fastq_paths[{mid}] tidak ditemukan: {local_path}"
+                )
+            if local_path.suffix == ".gz":
+                # Decompress streaming dari file lokal .gz
+                logger.info(f"[mockrobiota] mock-{mid} decompress dari file lokal: {local_path}")
+                sequences = _read_fastq_sequences_from_gz_file(
+                    local_path, max_reads=max_reads
+                )
+            else:
+                # Salin file lokal .fastq
+                import shutil
+                logger.info(f"[mockrobiota] mock-{mid} salin dari file lokal: {local_path}")
+                shutil.copy2(local_path, fastq_out)
+                sequences = None  # file sudah di-copy, baca saat diperlukan
+            if sequences is not None:
+                _write_fastq_sequences(fastq_out, sequences)
+                logger.info(f"[mockrobiota] mock-{mid} {len(sequences)} reads ditulis dari file lokal.")
+
+        elif streaming:
+            # Mode streaming: baca langsung dari URL, simpan hanya max_reads reads
+            fastq_gz_url = MOCKROBIOTA_S3_BASE.format(mock_id=mid)
+            logger.info(
+                f"[mockrobiota] mock-{mid} streaming {max_reads} reads dari URL "
+                f"(tanpa simpan file .gz penuh)..."
+            )
+            sequences = _stream_sequences_from_gz_url(
+                fastq_gz_url, max_reads=max_reads, retry=retry, delay=delay
+            )
+            _write_fastq_sequences(fastq_out, sequences)
+            logger.info(f"[mockrobiota] mock-{mid} {len(sequences)} reads disimpan ke {fastq_out}")
+
+        else:
+            # Mode full download: unduh dan decompress file penuh (~10 GB)
+            fastq_gz_url = MOCKROBIOTA_S3_BASE.format(mock_id=mid)
+            _download_and_decompress(fastq_gz_url, fastq_out, retry=retry, delay=delay)
 
         # ── Unduh expected-taxonomy.tsv ─────────────────────────────────────
         tax_url  = MOCKROBIOTA_EXPECTED_BASE.format(mock_id=mid)
@@ -127,27 +180,34 @@ def load_mockrobiota_dataset(
 
     mock_folder = Path(mock_dir) / f"mock-{mock_id}"
     fastq_path  = mock_folder / "mock-forward-read.fastq"
+    fastq_gz_path = mock_folder / "mock-forward-read.fastq.gz"
     tax_path    = mock_folder / "expected-taxonomy.tsv"
 
-    if not fastq_path.exists():
+    if not fastq_path.exists() and not fastq_gz_path.exists():
         raise FileNotFoundError(
-            f"FASTQ tidak ditemukan: {fastq_path}. "
-            "Jalankan download_mockrobiota() terlebih dahulu."
+            f"FASTQ tidak ditemukan: {fastq_path} (atau {fastq_gz_path}). "
+            "Jalankan download_mockrobiota() terlebih dahulu, atau "
+            "letakkan file .fastq/.fastq.gz secara manual di folder tersebut."
         )
 
     # Baca sekuens dari FASTQ secara streaming (1 baris per iterasi → O(1) memori)
     # FASTQ format: setiap record = 4 baris; baris ke-2 (index 1) = sequence
+    # Fallback: baca langsung dari .fastq.gz jika .fastq tidak ada
     sequences = []
-    with open(fastq_path, "r", errors="replace") as fh:
-        line_num = 0
-        for line in fh:
-            if line_num % 4 == 1:  # baris sequence dalam record FASTQ
-                seq = line.strip()
-                if seq:
-                    sequences.append(seq)
-                    if max_reads is not None and len(sequences) >= max_reads:
-                        break
-            line_num += 1
+    if fastq_path.exists():
+        with open(fastq_path, "r", errors="replace") as fh:
+            line_num = 0
+            for line in fh:
+                if line_num % 4 == 1:  # baris sequence dalam record FASTQ
+                    seq = line.strip()
+                    if seq:
+                        sequences.append(seq)
+                        if max_reads is not None and len(sequences) >= max_reads:
+                            break
+                line_num += 1
+    else:
+        # Baca langsung dari .fastq.gz tanpa decompress penuh ke disk
+        sequences = _read_fastq_sequences_from_gz_file(fastq_gz_path, max_reads=max_reads)
 
     # Baca expected taxonomy
     taxonomy = []
@@ -298,6 +358,84 @@ def fetch_ncbi_temporal_holdout(
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPER PRIVAT
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _stream_sequences_from_gz_url(
+    url: str,
+    max_reads: int = 2000,
+    retry: int = 3,
+    delay: float = 2.0,
+) -> list:
+    """
+    Baca sekuens FASTQ langsung dari URL .gz tanpa menyimpan file ke disk.
+
+    Menggunakan streaming HTTP + gzip sehingga hanya data yang dibutuhkan
+    (max_reads pertama) yang diunduh — koneksi ditutup segera setelah terpenuhi.
+    Hemat ruang disk secara drastis (menghindari download file ~10 GB).
+
+    Return:
+        list[str] — list sekuens DNA
+    """
+    for attempt in range(1, retry + 1):
+        try:
+            logger.info(f"Streaming FASTQ dari URL ({attempt}/{retry}): {url}")
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "taxograph-bert/1.0 data-acquisition"},
+            )
+            sequences = []
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                with gzip.open(resp, "rt", errors="replace") as gz_fh:
+                    line_num = 0
+                    for line in gz_fh:
+                        if line_num % 4 == 1:  # baris ke-2 setiap record FASTQ = sequence
+                            seq = line.strip()
+                            if seq:
+                                sequences.append(seq)
+                                if len(sequences) >= max_reads:
+                                    break
+                        line_num += 1
+            logger.info(f"Streaming selesai: {len(sequences)} reads diperoleh dari {url}")
+            return sequences
+        except Exception as exc:
+            logger.warning(f"Gagal streaming {url}: {exc}")
+            if attempt < retry:
+                time.sleep(delay)
+    raise RuntimeError(f"Gagal streaming setelah {retry} percobaan: {url}")
+
+
+def _read_fastq_sequences_from_gz_file(
+    gz_path: Path,
+    max_reads: Optional[int] = 2000,
+) -> list:
+    """
+    Baca sekuens FASTQ dari file .fastq.gz lokal tanpa decompress penuh ke disk.
+
+    Return:
+        list[str] — list sekuens DNA
+    """
+    sequences = []
+    with gzip.open(gz_path, "rt", errors="replace") as gz_fh:
+        line_num = 0
+        for line in gz_fh:
+            if line_num % 4 == 1:
+                seq = line.strip()
+                if seq:
+                    sequences.append(seq)
+                    if max_reads is not None and len(sequences) >= max_reads:
+                        break
+            line_num += 1
+    return sequences
+
+
+def _write_fastq_sequences(dest: Path, sequences: list) -> None:
+    """
+    Tulis list sekuens ke file .fastq minimal (hanya sequence lines, format FASTQ sederhana).
+    Digunakan untuk menyimpan hasil streaming agar tidak perlu re-download.
+    """
+    with open(dest, "w") as fh:
+        for i, seq in enumerate(sequences):
+            fh.write(f"@read_{i}\n{seq}\n+\n{'I' * len(seq)}\n")
+
 
 def _download_file(
     url: str,
