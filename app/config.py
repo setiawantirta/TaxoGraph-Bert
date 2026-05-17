@@ -205,6 +205,18 @@ class TrainConfig:
     pretrain_hgnn_lr: float = 0.01             # Riemannian SGD lr untuk Phase 1
     phase1_edge_batch_size: int = 4096         # edge per step Phase 1; kurangi jika VRAM <8 GB
 
+    # Optimizer untuk HyTaxGNN (parameter manifold Poincaré)
+    # "riemannianAdam" : geoopt.optim.RiemannianAdam — direkomendasikan
+    # "riemannianSGD"  : geoopt.optim.RiemannianSGD
+    # "adam"           : torch.optim.Adam (Euclidean; untuk ablasi)
+    # "adamW"          : torch.optim.AdamW (Euclidean; untuk ablasi)
+    hgnn_optimizer: str = "riemannianAdam"
+
+    # Mode geometri embedding
+    # "hyperbolic" : Poincaré ball aktif (default — untuk riset utama)
+    # "flat"       : Euclidean — HyTaxGNN di-bypass, OOD berbasis energy score
+    geometry_mode: str = "hyperbolic"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EVALUATION — metrik, backup, visualisasi

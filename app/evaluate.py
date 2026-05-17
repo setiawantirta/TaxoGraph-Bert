@@ -794,3 +794,139 @@ def _compute_fpr_at_tpr(
     if idx >= len(fpr):
         return float(fpr[-1])
     return float(fpr[idx])
+
+
+def evaluate_with_silva_classifier(
+    qza_path,
+    val_sequences,
+    val_labels,
+    label_enc,
+    cfg,
+    csv_path=None,
+    device: str = "cpu",
+):
+    """
+    Evaluasi SILVA Naive Bayes classifier dari file .qza sebagai baseline perbandingan.
+
+    File .qza adalah arsip ZIP yang berisi sklearn_pipeline.pkl (sklearn Pipeline).
+    Pipeline berisi TF-IDF k-mer vectorizer + Naive Bayes classifier.
+
+    Alasan digunakan: QIIME2's SILVA classifier adalah baseline standar komunitas
+    untuk klasifikasi 16S rRNA. Membandingkan TaxoGraph-BERT vs ini memberikan
+    konteks performa riset yang kuat.
+
+    Parameter:
+        qza_path       : path ke file .qza SILVA classifier
+        val_sequences  : list sekuens DNA (string) dari validation set
+        val_labels     : (N, 6) int array — ground truth label indices
+        label_enc      : HierarchicalLabelEncoder untuk decode predictions
+        cfg            : Config object
+        csv_path       : opsional — append hasil ke CSV; jika None gunakan cfg.paths.metric_dir
+        device         : tidak dipakai (classifier sklearn berjalan di CPU)
+
+    Return:
+        DataFrame dengan kolom: rank, f1_macro, n_samples, model
+        atau None jika .qza tidak ditemukan / ekstraksi gagal
+    """
+    import zipfile
+    import tempfile
+    import pickle
+    import pandas as pd
+    import numpy as np
+    from pathlib import Path as _Path
+    from sklearn.metrics import f1_score
+
+    qza_path = _Path(qza_path)
+    if not qza_path.exists():
+        logger.warning(f"[silva_baseline] File .qza tidak ditemukan: {qza_path}")
+        logger.info(
+            "[silva_baseline] Download SILVA classifier dari: "
+            "https://data.qiime2.org/2023.5/common/silva-138-99-seqs-515-806-nb-classifier.qza"
+        )
+        return None
+
+    # Ekstrak classifier dari arsip .qza (format: ZIP)
+    classifier = None
+    try:
+        with zipfile.ZipFile(str(qza_path), 'r') as zf:
+            pkl_files = [
+                n for n in zf.namelist()
+                if n.endswith('sklearn_pipeline.pkl') or n.endswith('classifier.pkl')
+            ]
+            if not pkl_files:
+                logger.error(f"[silva_baseline] Tidak ada classifier.pkl di dalam {qza_path.name}")
+                return None
+            with tempfile.TemporaryDirectory() as tmpdir:
+                extracted = zf.extract(pkl_files[0], path=tmpdir)
+                with open(extracted, 'rb') as f:
+                    classifier = pickle.load(f)
+                logger.info(f"[silva_baseline] Classifier dimuat dari {pkl_files[0]}")
+    except Exception as e:
+        logger.error(f"[silva_baseline] Gagal mengekstrak .qza: {e}")
+        return None
+
+    RANK_NAMES = ["Phylum", "Class", "Order", "Family", "Genus", "Species"]
+    rows = []
+
+    # SILVA NB classifier memprediksi full taxonomy string, bukan per-rank
+    # Contoh output: "d__Bacteria; p__Proteobacteria; c__Gammaproteobacteria; ..."
+    try:
+        predictions = classifier.predict(val_sequences)
+    except Exception as e:
+        logger.error(f"[silva_baseline] Gagal predict: {e}")
+        return None
+
+    rank_prefix_map = {
+        "Phylum": "p__", "Class": "c__", "Order": "o__",
+        "Family": "f__", "Genus": "g__", "Species": "s__",
+    }
+    for r_idx, rank in enumerate(RANK_NAMES):
+        y_true_indices = np.array(val_labels)[:, r_idx]
+        valid_mask = y_true_indices != 0  # skip PAD
+
+        if valid_mask.sum() == 0:
+            continue
+
+        rank_prefix = rank_prefix_map[rank]
+        pred_labels_str = []
+        for pred_str in predictions:
+            parts = str(pred_str).split("; ")
+            rank_val = next(
+                (p.split(rank_prefix)[-1] for p in parts if rank_prefix in p),
+                "Unknown"
+            )
+            pred_labels_str.append(rank_val)
+
+        # Encode ke indices via label_enc
+        try:
+            pred_indices = np.array([
+                label_enc.label2idx.get(rank, {}).get(lbl, 0)
+                for lbl in pred_labels_str
+            ])
+        except Exception:
+            pred_indices = np.zeros(len(pred_labels_str), dtype=int)
+
+        y_true_v = y_true_indices[valid_mask]
+        y_pred_v = pred_indices[valid_mask]
+
+        f1 = f1_score(y_true_v, y_pred_v, average="macro", zero_division=0)
+        rows.append({
+            "rank":      rank,
+            "f1_macro":  float(f1),
+            "n_samples": int(valid_mask.sum()),
+            "model":     "silva_naive_bayes",
+        })
+
+    df = pd.DataFrame(rows)
+
+    # Append ke CSV log jika diminta
+    if csv_path is not None or cfg is not None:
+        _csv = (
+            _Path(csv_path) if csv_path
+            else _Path(cfg.paths.metric_dir) / f"{cfg.experiment_name}_silva_baseline.csv"
+        )
+        df.to_csv(_csv, index=False, mode='a', header=not _csv.exists())
+        logger.info(f"[silva_baseline] Hasil disimpan ke: {_csv}")
+
+    logger.info(f"[silva_baseline] SILVA NB Classifier baseline:\n{df.to_string(index=False)}")
+    return df

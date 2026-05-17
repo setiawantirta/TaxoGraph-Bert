@@ -43,3 +43,28 @@ apakah jika saya download manual akan menjadi solusi?
 1. Melihat level spesies memiliki nilai f1 macro yang sangat pelan perbaikannya, disarankan menggunakan Focal Loss
 2. hitung juga Validasi loss_rank_0, loss_rank_1, loss_rank_2, loss_rank_3, loss_rank_4, loss_rank_5 dan tamahkan ke dalam log csv
 3. apakah kode sudah memanfaatkan nn.parallel.DistributedDataParallel (DDP)
+
+
+========================================================================================================================================================================================================
+1. Jika kita membedah kode trainer.py Anda, di Phase 1 Anda dengan sangat tepat menggunakan geoopt.optim.RiemannianSGD untuk melatih ruang hiperbolik (Poincaré ball).
+Namun, ketika masuk ke Phase 2 (_build_optimizers), Anda memasukkan parameter hytaxgnn ke dalam optimasi torch.optim.AdamW biasa.
+
+Mengapa ini menjadi masalah?
+AdamW bawaan PyTorch bekerja dengan asumsi Geometri Euclidean (ruang datar). Ketika AdamW memperbarui bobot HyTaxGNN, ia menarik dan mendorong node-node taksonomi secara garis lurus. Padahal, node tersebut hidup di dalam ruang hiperbolik (mangkuk melengkung).
+Akibatnya:
+
+Struktur hierarki yang susah payah dibangun di Phase 1 perlahan-lahan "rusak" atau terdistorsi di Phase 2.
+
+Pemisahan antar-spesies yang memiliki kemiripan DNA yang sangat tipis menjadi tumpul, karena model mengabaikan kelengkungan ruang.
+
+Solusi Optimasi: Menggunakan RiemannianAdam
+Untuk kasus arsitektur hibrida (Euclidean + Hyperbolic) seperti milik Anda, algoritma yang paling tepat adalah Riemannian Adam.
+
+Library geoopt memiliki geoopt.optim.RiemannianAdam.
+
+mohon buatkan saya beberapa opsi di parameter yaitu riemanianAdam, Adam, adamW, RiemannianSGD defaultnya adalah riemanianAdam, kedepannya ini akan menjadi memudahkan pengembangan selanjutnya
+2. Saya menggunakan Hyperbolic/ruang Hiperbolik pada riset ini, apakah mungkin bisa buatkan saya satu pendekatan lagi yaitu menggunakan ruang datar. jadikan ini opsi juga di paremneter dengan defaulnya dalah hyperbolic. kenapa demikina kedepanya jika saya ingin melakukan riset perbandingan itu jadi sangat mudah dan masuk akal. mohon outputnya di append juga ke dalam log csv dengan cerdas
+3. oh iya saya baru kepikiran, silva_model classifier yang kita gunakan berformat qza ini berisi file .pkl kan ya? berarti bisa kitagunakan untuk melakukan perhitungan metrik ya? apakah ini sudah di tambahkan arau sudaha da pada tahap analysis?
+4. tambahkan cara penggunaan dan setting nya di cell sebelum preprocess
+
+saya ingin pembahruan kode tidak mengganggu 20 epoch yang sudah saya jalankan sebelumnya, saya ingin bisa lanut ke epoch berikutnya, apakah mungin? dan bisa?

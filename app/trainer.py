@@ -30,7 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.amp import GradScaler, autocast  # torch.cuda.amp deprecated since PyTorch 2.4
-from torch.optim import AdamW
+from torch.optim import AdamW, Adam
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
 from tqdm.auto import tqdm
 from loguru import logger
@@ -237,8 +237,10 @@ class Trainer:
         )
 
         # ── Optimizers (diinisialisasi di _build_optimizers) ──────────
-        self.optimizer   = None
-        self.scheduler   = None
+        self.optimizer       = None
+        self.scheduler       = None
+        self.hgnn_optimizer  = None
+        self.hgnn_scheduler  = None
         # GradScaler hanya efektif di CUDA; CPU/MPS gunakan dummy (enabled=False)
         _amp_device = self.device.type if self.device.type == 'cuda' else 'cpu'
         _amp_enabled = cfg.train.use_amp and self.device.type == 'cuda'
@@ -272,7 +274,9 @@ class Trainer:
 
         # ── CSV backup ─────────────────────────────────────────────────
         _suffix = f"_{run_tag}" if run_tag else ""
-        self.csv_path = self.metric_dir / f"{cfg.experiment_name}{_suffix}_train_log.csv"
+        _geo  = getattr(cfg.train, 'geometry_mode', 'hyperbolic')
+        _hopt = getattr(cfg.train, 'hgnn_optimizer', 'riemannianAdam')
+        self.csv_path = self.metric_dir / f"{cfg.experiment_name}{_suffix}_{_geo}_{_hopt}_train_log.csv"
         # Gunakan append=True agar file lama tidak langsung ditimpa saat Trainer
         # di-instansiasi ulang (misal sesi Kaggle restart). File baru tetap dibuat
         # dengan header jika belum ada. train() akan menimpa hanya jika bukan resume.
@@ -295,7 +299,7 @@ class Trainer:
             return  # pertahankan file yang sudah ada
         with open(self.csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=[
-                "epoch", "phase", "loss_total",
+                "epoch", "phase", "geometry_mode", "hgnn_optimizer", "loss_total",
                 *[f"loss_rank_{r}" for r in range(6)],
                 *[f"f1_{rank}" for rank in self.RANK_NAMES],
                 "f1_macro", "lr", "elapsed_sec",
@@ -434,11 +438,12 @@ class Trainer:
         lr_min = tcfg.plateau_lr_min
 
         new_lrs = []
-        for pg in self.optimizer.param_groups:
-            old_lr = pg["lr"]
-            new_lr = max(old_lr * factor, lr_min)
-            pg["lr"] = new_lr
-            new_lrs.append(f"{old_lr:.2e}→{new_lr:.2e}")
+        for _opt in [self.optimizer] + ([self.hgnn_optimizer] if self.hgnn_optimizer else []):
+            for pg in _opt.param_groups:
+                old_lr = pg["lr"]
+                new_lr = max(old_lr * factor, lr_min)
+                pg["lr"] = new_lr
+                new_lrs.append(f"{old_lr:.2e}→{new_lr:.2e}")
 
         self._plateau_lr_reductions += 1
         logger.warning(
@@ -484,24 +489,15 @@ class Trainer:
             f"{n_perturbed:,} Euclidean parameter."
         )
 
-        # 2. LR spike 5× untuk HyTaxGNN (hanya param_group yang mengandung hytaxgnn params)
-        hgnn_param_ids = {
-            id(p) for p in self._raw_model.hytaxgnn.parameters()
-        } if hasattr(self._raw_model, "hytaxgnn") else set()
-
-        if hgnn_param_ids:
+        # 2. LR spike 5× untuk HyTaxGNN via dedicated optimizer
+        if self.hgnn_optimizer is not None:
             self._hgnn_lr_before_spike = []
-            for pg in self.optimizer.param_groups:
-                pg_param_ids = {id(p) for p in pg["params"]}
-                if pg_param_ids & hgnn_param_ids:  # interseksi: ini adalah group HGNN
-                    old_lr = pg["lr"]
-                    pg["lr"] = old_lr * 5.0
-                    self._hgnn_lr_before_spike.append((pg, old_lr))
-                    logger.warning(
-                        f"[saddle_escape] HyTaxGNN LR spike: {old_lr:.2e} → {pg['lr']:.2e} "
-                        f"(akan dikembalikan setelah 1 epoch)"
-                    )
+            for pg in self.hgnn_optimizer.param_groups:
+                old_lr = pg["lr"]
+                pg["lr"] = old_lr * 5.0
+                self._hgnn_lr_before_spike.append((pg, old_lr))
             self._hgnn_lr_spike_active = True
+            logger.warning("[saddle_escape] HyTaxGNN LR spike 5× via hgnn_optimizer.")
 
         # 3. Reset scheduler cosine cycle ke T_cur = 0
         if hasattr(self.scheduler, "last_epoch"):
@@ -617,45 +613,77 @@ class Trainer:
     # ── PHASE 2: Joint Fine-tuning ────────────────────────────────────────
     def _build_optimizers(self):
         """
-        Bangun optimizer terpisah untuk Transformer backbone dan komponen lain.
+        Bangun optimizer terpisah untuk Transformer backbone, komponen Euclidean,
+        dan HyTaxGNN (Poincaré manifold).
         Learning rate berbeda: Transformer lebih kecil (3e-5) karena sudah pre-trained.
+        HyTaxGNN menggunakan Riemannian optimizer agar update tetap di manifold Poincaré.
         """
         tcfg = self.cfg.train
-        mcfg = self.cfg.model
+        hgnn_opt_type = getattr(tcfg, 'hgnn_optimizer', 'riemannianAdam')
+        geometry_mode = getattr(tcfg, 'geometry_mode', 'hyperbolic')
 
-        # Kelompokkan parameter berdasarkan komponen
         transformer_params = list(self._raw_model.seq_encoder.parameters())
-        other_params = (
-            list(self._raw_model.hytaxgnn.parameters())
-            + list(self._raw_model.fusion.parameters())
+        euclidean_params = (
+            list(self._raw_model.fusion.parameters())
             + list(self._raw_model.classifier.parameters())
             + list(self._raw_model.ood_head.parameters())
         )
-
         self.optimizer = AdamW([
             {"params": transformer_params, "lr": tcfg.lr_transformer,
              "weight_decay": tcfg.weight_decay_transformer},
-            {"params": other_params,       "lr": tcfg.lr_classifier,
+            {"params": euclidean_params,   "lr": tcfg.lr_classifier,
              "weight_decay": 1e-4},
         ])
 
-        # Scheduler: linear warmup → cosine annealing
-        total_steps   = len(self.train_dl) * tcfg.max_epochs // tcfg.gradient_accumulation_steps
-        warmup_steps  = int(total_steps * tcfg.warmup_ratio)
+        hgnn_params = list(self._raw_model.hytaxgnn.parameters())
+        if geometry_mode == 'flat':
+            self.hgnn_optimizer = None
+            logger.info("geometry_mode='flat': hgnn_optimizer dinonaktifkan.")
+        else:
+            if hgnn_opt_type in ('riemannianAdam', 'riemannianSGD'):
+                try:
+                    import geoopt
+                    if hgnn_opt_type == 'riemannianAdam':
+                        self.hgnn_optimizer = geoopt.optim.RiemannianAdam(
+                            hgnn_params, lr=tcfg.lr_hgnn, stabilize=10)
+                    else:
+                        self.hgnn_optimizer = geoopt.optim.RiemannianSGD(
+                            hgnn_params, lr=tcfg.lr_hgnn, stabilize=10)
+                    logger.info(f"HyTaxGNN optimizer: {hgnn_opt_type} (geoopt) lr={tcfg.lr_hgnn}")
+                except ImportError:
+                    logger.warning("geoopt tidak terinstall, fallback ke AdamW untuk HyTaxGNN.")
+                    self.hgnn_optimizer = AdamW(hgnn_params, lr=tcfg.lr_hgnn, weight_decay=1e-4)
+            elif hgnn_opt_type == 'adam':
+                self.hgnn_optimizer = Adam(hgnn_params, lr=tcfg.lr_hgnn)
+                logger.info(f"HyTaxGNN optimizer: Adam (Euclidean) lr={tcfg.lr_hgnn}")
+            else:  # 'adamW'
+                self.hgnn_optimizer = AdamW(hgnn_params, lr=tcfg.lr_hgnn, weight_decay=1e-4)
+                logger.info(f"HyTaxGNN optimizer: AdamW (Euclidean) lr={tcfg.lr_hgnn}")
 
-        warmup_sched  = LinearLR(self.optimizer, start_factor=0.1,
-                                  end_factor=1.0, total_iters=warmup_steps)
-        cosine_sched  = CosineAnnealingWarmRestarts(
-            self.optimizer, T_0=total_steps - warmup_steps, eta_min=1e-6
-        )
+        # Scheduler: linear warmup → cosine annealing (untuk optimizer Euclidean)
+        total_steps  = len(self.train_dl) * tcfg.max_epochs // tcfg.gradient_accumulation_steps
+        warmup_steps = int(total_steps * tcfg.warmup_ratio)
+
+        warmup_sched = LinearLR(self.optimizer, start_factor=0.1,
+                                end_factor=1.0, total_iters=warmup_steps)
+        cosine_sched = CosineAnnealingWarmRestarts(
+            self.optimizer, T_0=max(total_steps - warmup_steps, 1), eta_min=1e-6)
         self.scheduler = SequentialLR(
             self.optimizer, schedulers=[warmup_sched, cosine_sched],
-            milestones=[warmup_steps]
-        )
+            milestones=[warmup_steps])
 
-        logger.info(f"Optimizer: {len(transformer_params)} Transformer params "
-                    f"(lr={tcfg.lr_transformer}) + "
-                    f"{len(other_params)} other params (lr={tcfg.lr_classifier})")
+        # Cosine scheduler terpisah untuk HyTaxGNN (tanpa warmup — sudah selesai di Phase 1)
+        if self.hgnn_optimizer is not None:
+            self.hgnn_scheduler = CosineAnnealingWarmRestarts(
+                self.hgnn_optimizer, T_0=max(total_steps, 1), eta_min=1e-7)
+        else:
+            self.hgnn_scheduler = None
+
+        logger.info(
+            f"Optimizer Euclidean: {len(transformer_params)} Transformer params "
+            f"(lr={tcfg.lr_transformer}) + {len(euclidean_params)} other params "
+            f"(lr={tcfg.lr_classifier}) | total_steps={total_steps} warmup={warmup_steps}"
+        )
 
     def setup_optimizers(self):
         """Public alias untuk _build_optimizers — kompatibilitas notebook."""
@@ -713,10 +741,16 @@ class Trainer:
 
             # Pre-komputasi node embeddings HyTaxGNN sekali per epoch
             # (menghindari re-komputasi 17k× di dalam _train_one_epoch per batch)
-            with torch.no_grad():
-                _node_emb = self._raw_model.hytaxgnn(
-                    self._raw_model.edge_index
-                ).detach()
+            _geometry_mode = getattr(tcfg, 'geometry_mode', 'hyperbolic')
+            if _geometry_mode == 'flat':
+                _num_nodes    = self._raw_model.hytaxgnn.node_emb.num_embeddings
+                _poincare_dim = getattr(self.cfg.model, 'poincare_dim', 128)
+                _node_emb = torch.zeros(_num_nodes, _poincare_dim, device=self.device)
+            else:
+                with torch.no_grad():
+                    _node_emb = self._raw_model.hytaxgnn(
+                        self._raw_model.edge_index
+                    ).detach()
             self._raw_model._node_emb_cache = _node_emb
 
             # Training
@@ -739,25 +773,29 @@ class Trainer:
 
             # Baris train terpisah
             train_row = {
-                "epoch":      epoch,
-                "phase":      "train",
-                "loss_total": train_metrics.get("loss_total", 0),
+                "epoch":          epoch,
+                "phase":          "train",
+                "geometry_mode":  getattr(self.cfg.train, 'geometry_mode', 'hyperbolic'),
+                "hgnn_optimizer": getattr(self.cfg.train, 'hgnn_optimizer', 'riemannianAdam'),
+                "loss_total":     train_metrics.get("loss_total", 0),
                 **{f"loss_rank_{r}": train_metrics.get(f"loss_rank_{r}", 0) for r in range(6)},
                 **{f"f1_{rn}": train_metrics.get(f"f1_{rn}", 0.0) for rn in self.RANK_NAMES},
-                "f1_macro":   train_metrics.get("f1_macro", 0.0),
-                "lr":         current_lr,
-                "elapsed_sec": elapsed,
+                "f1_macro":       train_metrics.get("f1_macro", 0.0),
+                "lr":             current_lr,
+                "elapsed_sec":    elapsed,
             }
             # Baris val terpisah
             val_row = {
-                "epoch":      epoch,
-                "phase":      "val",
-                "loss_total": val_loss,
+                "epoch":          epoch,
+                "phase":          "val",
+                "geometry_mode":  getattr(self.cfg.train, 'geometry_mode', 'hyperbolic'),
+                "hgnn_optimizer": getattr(self.cfg.train, 'hgnn_optimizer', 'riemannianAdam'),
+                "loss_total":     val_loss,
                 **{f"loss_rank_{r}": val_metrics.get(f"loss_rank_{r}", 0.0) for r in range(6)},
                 **{f"f1_{rn}": val_metrics.get(f"f1_{rn}", 0) for rn in self.RANK_NAMES},
-                "f1_macro":   val_f1,
-                "lr":         current_lr,
-                "elapsed_sec": elapsed,
+                "f1_macro":       val_f1,
+                "lr":             current_lr,
+                "elapsed_sec":    elapsed,
             }
             self._append_csv(train_row)
             self._append_csv(val_row)
@@ -898,12 +936,16 @@ class Trainer:
             # Update ogni `accumulate` steps
             if (step + 1) % accumulate == 0:
                 if self.device.type == 'cuda':
-                    # Gradient clipping via scaler (CUDA)
+                    # Gradient clipping via scaler (CUDA) — unscale semua optimizer dulu
                     self.scaler.unscale_(self.optimizer)
+                    if self.hgnn_optimizer is not None:
+                        self.scaler.unscale_(self.hgnn_optimizer)
                     nn.utils.clip_grad_norm_(
                         self.model.parameters(), tcfg.max_grad_norm
                     )
                     self.scaler.step(self.optimizer)
+                    if self.hgnn_optimizer is not None:
+                        self.scaler.step(self.hgnn_optimizer)
                     self.scaler.update()
                 else:
                     # Gradient clipping tanpa scaler (CPU / MPS)
@@ -911,8 +953,14 @@ class Trainer:
                         self.model.parameters(), tcfg.max_grad_norm
                     )
                     self.optimizer.step()
+                    if self.hgnn_optimizer is not None:
+                        self.hgnn_optimizer.step()
                 self.optimizer.zero_grad()
+                if self.hgnn_optimizer is not None:
+                    self.hgnn_optimizer.zero_grad()
                 self.scheduler.step()
+                if self.hgnn_scheduler is not None:
+                    self.hgnn_scheduler.step()
                 self.global_step += 1
 
             # Akumulasi metrik
@@ -1029,6 +1077,8 @@ class Trainer:
             "model_state":        self._raw_model.state_dict(),
             "optimizer":          self.optimizer.state_dict(),
             "scheduler":          self.scheduler.state_dict() if self.scheduler else None,
+            "hgnn_optimizer":     self.hgnn_optimizer.state_dict() if self.hgnn_optimizer else None,
+            "hgnn_scheduler":     self.hgnn_scheduler.state_dict() if self.hgnn_scheduler else None,
             "scaler":             self.scaler.state_dict(),
             "best_val_f1":        self.best_val_f1,
             "val_f1_macro":       self.best_val_f1,  # alias agar notebook Phase 2 cell tidak KeyError
@@ -1053,9 +1103,25 @@ class Trainer:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self._raw_model.load_state_dict(ckpt["model_state"])
         if self.optimizer and "optimizer" in ckpt:
-            self.optimizer.load_state_dict(ckpt["optimizer"])
+            try:
+                self.optimizer.load_state_dict(ckpt["optimizer"])
+            except Exception as _e:
+                logger.warning(f"Tidak dapat memuat optimizer state (struktur berubah): {_e}. Mulai fresh.")
+        if self.hgnn_optimizer and ckpt.get("hgnn_optimizer"):
+            try:
+                self.hgnn_optimizer.load_state_dict(ckpt["hgnn_optimizer"])
+            except Exception as _e:
+                logger.warning(f"Tidak dapat memuat hgnn_optimizer state: {_e}. Mulai fresh.")
         if self.scheduler and ckpt.get("scheduler"):
-            self.scheduler.load_state_dict(ckpt["scheduler"])
+            try:
+                self.scheduler.load_state_dict(ckpt["scheduler"])
+            except Exception as _e:
+                logger.warning(f"Tidak dapat memuat scheduler state: {_e}. Mulai fresh.")
+        if self.hgnn_scheduler and ckpt.get("hgnn_scheduler"):
+            try:
+                self.hgnn_scheduler.load_state_dict(ckpt["hgnn_scheduler"])
+            except Exception as _e:
+                logger.warning(f"Tidak dapat memuat hgnn_scheduler state: {_e}. Mulai fresh.")
         if ckpt.get("scaler"):
             self.scaler.load_state_dict(ckpt["scaler"])
         self.best_val_f1       = ckpt.get("best_val_f1", 0.0)
@@ -1101,9 +1167,26 @@ class Trainer:
         # Bangun optimizer/scheduler dulu jika belum ada, lalu restore state
         if self.optimizer is None:
             self._build_optimizers()
-        self.optimizer.load_state_dict(ckpt["optimizer"])
+        if "optimizer" in ckpt:
+            try:
+                self.optimizer.load_state_dict(ckpt["optimizer"])
+            except Exception as _e:
+                logger.warning(f"Tidak dapat memuat optimizer state (struktur berubah): {_e}. Mulai fresh.")
+        if self.hgnn_optimizer and ckpt.get("hgnn_optimizer"):
+            try:
+                self.hgnn_optimizer.load_state_dict(ckpt["hgnn_optimizer"])
+            except Exception as _e:
+                logger.warning(f"Tidak dapat memuat hgnn_optimizer state: {_e}. Mulai fresh.")
         if self.scheduler and ckpt.get("scheduler"):
-            self.scheduler.load_state_dict(ckpt["scheduler"])
+            try:
+                self.scheduler.load_state_dict(ckpt["scheduler"])
+            except Exception as _e:
+                logger.warning(f"Tidak dapat memuat scheduler state: {_e}. Mulai fresh.")
+        if self.hgnn_scheduler and ckpt.get("hgnn_scheduler"):
+            try:
+                self.hgnn_scheduler.load_state_dict(ckpt["hgnn_scheduler"])
+            except Exception as _e:
+                logger.warning(f"Tidak dapat memuat hgnn_scheduler state: {_e}. Mulai fresh.")
         if ckpt.get("scaler"):
             self.scaler.load_state_dict(ckpt["scaler"])
 
@@ -1125,9 +1208,14 @@ class Trainer:
     def _calibrate_ood(self):
         """
         Kalibrasi threshold OOD head menggunakan val_dl setelah training selesai.
-        Mengumpulkan hyp_emb dari seluruh val set, hitung OOD scores,
-        dan panggil model.ood_head.calibrate() untuk menetapkan threshold delta.
+        Untuk mode hyperbolic: mengumpulkan hyp_emb, hitung jarak Poincaré.
+        Untuk mode flat: menggunakan energy-based OOD score (Liu et al. 2020).
         """
+        geometry_mode = getattr(self.cfg.train, 'geometry_mode', 'hyperbolic')
+        if geometry_mode == 'flat':
+            self._calibrate_ood_flat()
+            return
+
         logger.info("Mengkalibrasi OOD threshold dari validation set...")
         self.model.eval()
 
@@ -1150,3 +1238,29 @@ class Trainer:
             logger.info(f"OOD threshold dikalibrasi: delta = {self._raw_model.ood_head.threshold.item():.4f}")
         else:
             logger.warning("Val set kosong; OOD threshold tidak dikalibrasi.")
+
+    @torch.no_grad()
+    def _calibrate_ood_flat(self):
+        """Energy-based OOD threshold calibration untuk flat mode (Liu et al. 2020).
+        Score = -mean_rank[logsumexp(logits_r)] — nilai lebih tinggi = lebih OOD.
+        Tanda ini konsisten dengan konvensi jarak hiperbolik (positif = OOD).
+        """
+        logger.info("Mengkalibrasi energy-based OOD threshold (flat mode)...")
+        self.model.eval()
+        all_scores = []
+        for batch in tqdm(self.val_dl, desc="OOD calibration (flat)", leave=False):
+            input_ids      = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            out    = self.model(input_ids, attention_mask, update_graph=False)
+            logits = out["logits"]  # list of 6 (B, C)
+            # Energy OOD score: -logsumexp (nilai lebih tinggi = lebih OOD)
+            energy = -torch.stack([
+                torch.logsumexp(lg.float(), dim=-1) for lg in logits
+            ]).mean(dim=0)  # (B,)
+            all_scores.append(energy.cpu())
+        if all_scores:
+            all_scores_tensor = torch.cat(all_scores)
+            self._raw_model.ood_head.calibrate(all_scores_tensor)
+            logger.info(f"OOD threshold (flat/energy): delta = {self._raw_model.ood_head.threshold.item():.4f}")
+        else:
+            logger.warning("Val set kosong; OOD threshold tidak dikalibrasi (flat mode).")
