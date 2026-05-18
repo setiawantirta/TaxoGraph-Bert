@@ -733,13 +733,22 @@ class Trainer:
 
         self._training_complete = False
 
-        epoch_pbar = tqdm(range(start_epoch + 1, tcfg.max_epochs + 1),
-                          desc="Epoch", unit="epoch", position=0, leave=True)
+        # Path checkpoint terbaru — digunakan untuk rollback jika epoch gagal NaN/OOM
+        _suffix      = f"_{self._run_tag}" if self._run_tag else ""
+        _latest_ckpt = self.ckpt_dir / f"{self.cfg.experiment_name}{_suffix}_latest.pt"
 
-        for epoch in epoch_pbar:
+        # While loop (bukan for) agar epoch counter dapat diulang saat rollback/retry
+        epoch_pbar = tqdm(total=tcfg.max_epochs - start_epoch,
+                          desc=f"Epoch {start_epoch + 1}", unit="epoch", position=0, leave=True)
+
+        epoch            = start_epoch + 1
+        _nan_retry_count = 0  # jumlah kegagalan berturut-turut pada epoch ini
+
+        while epoch <= tcfg.max_epochs:
+            epoch_pbar.set_description(f"Epoch {epoch}")
             t_start = time.time()
 
-            # Pre-komputasi node embeddings HyTaxGNN sekali per epoch
+            # ── Pre-komputasi node embeddings HyTaxGNN sekali per epoch ──────
             # (menghindari re-komputasi 17k× di dalam _train_one_epoch per batch)
             _geometry_mode = getattr(tcfg, 'geometry_mode', 'hyperbolic')
             if _geometry_mode == 'flat':
@@ -747,16 +756,65 @@ class Trainer:
                 _poincare_dim = getattr(self.cfg.model, 'poincare_dim', 128)
                 _node_emb = torch.zeros(_num_nodes, _poincare_dim, device=self.device)
             else:
-                with torch.no_grad():
-                    _node_emb = self._raw_model.hytaxgnn(
-                        self._raw_model.edge_index
-                    ).detach()
+                # Fix 4: bebaskan memori terfragmentasi sebelum GNN forward + guard CUDA OOM
+                if self.device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                try:
+                    with torch.no_grad():
+                        _node_emb = self._raw_model.hytaxgnn(
+                            self._raw_model.edge_index
+                        ).detach()
+                except RuntimeError as _oom:
+                    if 'out of memory' in str(_oom).lower():
+                        if self.device.type == 'cuda':
+                            torch.cuda.empty_cache()
+                        _nan_retry_count += 1
+                        if _nan_retry_count >= 3:
+                            logger.error(
+                                f"Epoch {epoch}: CUDA OOM pada GNN cache "
+                                f"{_nan_retry_count}× berturut-turut → training dihentikan."
+                            )
+                            break
+                        logger.warning(
+                            f"Epoch {epoch}: CUDA OOM pada GNN cache (ke-{_nan_retry_count}) "
+                            f"→ model belum berubah, retry epoch {epoch}."
+                        )
+                        continue  # retry epoch yang sama; model weights belum tersentuh
+                    raise
             self._raw_model._node_emb_cache = _node_emb
 
-            # Training
+            # ── Training ─────────────────────────────────────────────────────
             train_metrics = self._train_one_epoch(epoch)
 
-            # Validation
+            # ── Rollback + retry jika epoch menghasilkan NaN ─────────────────
+            if train_metrics.get("nan_epoch", False):
+                _nan_retry_count += 1
+                if _nan_retry_count >= 3:
+                    logger.error(
+                        f"Epoch {epoch}: NaN loss {_nan_retry_count}× berturut-turut "
+                        f"→ training dihentikan."
+                    )
+                    break
+                if _latest_ckpt.exists():
+                    self.load_checkpoint(str(_latest_ckpt))
+                    if self.device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                    logger.warning(
+                        f"Epoch {epoch}: NaN loss (ke-{_nan_retry_count}) → "
+                        f"rollback ke checkpoint terbaru, retry epoch {epoch}."
+                    )
+                else:
+                    logger.error(
+                        f"Epoch {epoch}: NaN loss tapi tidak ada checkpoint untuk rollback "
+                        f"→ training dihentikan."
+                    )
+                    break
+                continue  # retry epoch yang sama dengan state bersih dari checkpoint
+
+            # Epoch sukses — reset retry counter
+            _nan_retry_count = 0
+
+            # ── Validation ───────────────────────────────────────────────────
             val_metrics   = self._validate(epoch)
 
             elapsed = time.time() - t_start
@@ -856,10 +914,10 @@ class Trainer:
                     )
                     break
 
-            # Selalu simpan checkpoint terbaru
+            # Selalu simpan checkpoint terbaru (hanya epoch sukses)
             self._save_checkpoint(epoch, "latest")
 
-            # Update postfix dengan info patience untuk monitoring
+            # Update postfix, advance progress bar, lalu maju ke epoch berikutnya
             epoch_pbar.set_postfix({
                 "val_f1":   f"{val_f1:.4f}",
                 "val_loss": f"{val_loss:.4f}",
@@ -867,6 +925,8 @@ class Trainer:
                 "loss_pat": f"{self.loss_patience_ctr}/{plateau_p}",
                 "f1_pat":   f"{self.f1_patience_ctr}/{tcfg.early_stopping_patience}",
             })
+            epoch_pbar.update(1)
+            epoch += 1
 
         # Tandai training selesai (digunakan saat simpan _latest checkpoint terakhir)
         self._training_complete = True
@@ -904,6 +964,7 @@ class Trainer:
         )
 
         self.optimizer.zero_grad()
+        _nan_break = False
 
         for step, batch in pbar:
             input_ids      = batch["input_ids"].to(self.device)
@@ -918,6 +979,18 @@ class Trainer:
                 logits = out["logits"]
                 loss, loss_dict = self.criterion(logits, labels)
                 loss = loss / accumulate  # normalize untuk gradient accumulation
+
+            # Guard NaN: jika loss NaN, batalkan epoch dan sinyal rollback ke trainer
+            if torch.isnan(loss):
+                self.optimizer.zero_grad()
+                if self.hgnn_optimizer is not None:
+                    self.hgnn_optimizer.zero_grad()
+                logger.warning(
+                    f"NaN loss terdeteksi di epoch {epoch} step {step} "
+                    f"(batch {step + 1}/{len(self.train_dl)}) → epoch dibatalkan."
+                )
+                _nan_break = True
+                break
 
             # Kumpulkan prediksi untuk Train F1 (argmax saja, tanpa forward pass tambahan)
             for _r in range(6):
@@ -970,6 +1043,14 @@ class Trainer:
             n_batches += 1
 
             pbar.set_postfix({"loss": f"{loss_dict['loss_total']:.4f}"})
+
+        # Kembalikan penanda NaN agar train() bisa melakukan rollback
+        if _nan_break:
+            _nan_result = {"nan_epoch": True, "loss_total": float("nan")}
+            _nan_result.update({f"loss_rank_{r}": float("nan") for r in range(6)})
+            _nan_result.update({f"f1_{rn}": 0.0 for rn in self.RANK_NAMES})
+            _nan_result["f1_macro"] = 0.0
+            return _nan_result
 
         # Rata-rata
         avg = {"loss_total": total_loss / max(n_batches, 1)}

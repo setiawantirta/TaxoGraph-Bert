@@ -68,3 +68,71 @@ mohon buatkan saya beberapa opsi di parameter yaitu riemanianAdam, Adam, adamW, 
 4. tambahkan cara penggunaan dan setting nya di cell sebelum preprocess
 
 saya ingin pembahruan kode tidak mengganggu 20 epoch yang sudah saya jalankan sebelumnya, saya ingin bisa lanut ke epoch berikutnya, apakah mungin? dan bisa?
+========================================================================================================================================================================================================
+
+---------------------------------------------------------------------------
+OutOfMemoryError                          Traceback (most recent call last)
+/tmp/ipykernel_120/2237437530.py in <cell line: 0>()
+     21 
+     22 with torch.no_grad():
+---> 23     node_emb = gnn(edge_index)   # (N, hidden_dim)
+     24 
+     25 norm_vals = node_emb.norm(dim=-1).cpu().numpy()
+
+/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py in _wrapped_call_impl(self, *args, **kwargs)
+   1774             return self._compiled_call_impl(*args, **kwargs)  # type: ignore[misc]
+   1775         else:
+-> 1776             return self._call_impl(*args, **kwargs)
+   1777 
+   1778     # torchrec tests the code consistency with the following code
+
+/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py in _call_impl(self, *args, **kwargs)
+   1785                 or _global_backward_pre_hooks or _global_backward_hooks
+   1786                 or _global_forward_hooks or _global_forward_pre_hooks):
+-> 1787             return forward_call(*args, **kwargs)
+   1788 
+   1789         result = None
+
+/kaggle/working/app/hyperbolic.py in forward(self, edge_index)
+    334         # Propagasi melalui HGCN layers
+    335         for layer in self.layers:
+--> 336             h_new = layer(h, edge_index)                 # (N, hidden_dim) di Poincaré
+    337 
+    338             # Tangent space
+
+/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py in _wrapped_call_impl(self, *args, **kwargs)
+   1774             return self._compiled_call_impl(*args, **kwargs)  # type: ignore[misc]
+   1775         else:
+-> 1776             return self._call_impl(*args, **kwargs)
+   1777 
+   1778     # torchrec tests the code consistency with the following code
+
+/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py in _call_impl(self, *args, **kwargs)
+   1785                 or _global_backward_pre_hooks or _global_backward_hooks
+   1786                 or _global_forward_hooks or _global_forward_pre_hooks):
+-> 1787             return forward_call(*args, **kwargs)
+   1788 
+   1789         result = None
+
+/kaggle/working/app/hyperbolic.py in forward(self, x, edge_index)
+    235         agg = torch.zeros(N, out_dim, device=x.device, dtype=h_trans.dtype)
+    236         idx = dst.unsqueeze(1).expand(-1, out_dim)    # (E, out_dim)
+--> 237         agg.scatter_add_(0, idx, h_trans[src])         # sum messages per dst node
+    238 
+    239         # Hitung in-degree tiap node untuk normalisasi mean
+
+OutOfMemoryError: CUDA out of memory. Tried to allocate 5.64 GiB. GPU 0 has a total capacity of 14.56 GiB of which 2.84 GiB is free. Including non-PyTorch memory, this process has 11.72 GiB memory in use. Of the allocated memory 1009.50 MiB is allocated by PyTorch, and 10.53 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+
+dan ada error bereikut juga loss=nan setelah saya runn ulang kernel
+2026-05-17 17:19:14.123 | INFO     | trainer:_init_csv:298 - CSV log (resume/append): /kaggle/working/outputs/metrics/taxograph_bert_v1_hyperbolic_riemannianAdam_train_log.csv
+Phase 2: Memulai / melanjutkan joint fine-tuning...
+2026-05-17 17:19:14.333 | INFO     | trainer:_build_optimizers:652 - HyTaxGNN optimizer: riemannianAdam (geoopt) lr=0.0001
+2026-05-17 17:19:14.334 | INFO     | trainer:_build_optimizers:682 - Optimizer Euclidean: 162 Transformer params (lr=3e-05) + 27 other params (lr=0.0005) | total_steps=216275 warmup=12976
+2026-05-17 17:19:14.335 | INFO     | trainer:train:702 - === PHASE 2: Joint Fine-tuning ===
+2026-05-17 17:19:14.806 | INFO     | trainer:resume_from_latest:1199 - Resume dari epoch 30 | best_f1=0.5825 | best_loss=6.2531 | loss_pat=2 | f1_pat=0 | global_step=32430
+2026-05-17 17:19:14.807 | INFO     | trainer:_init_csv:298 - CSV log (resume/append): /kaggle/working/outputs/metrics/taxograph_bert_v1_hyperbolic_riemannianAdam_train_log.csv
+2026-05-17 17:19:14.808 | INFO     | trainer:train:729 - Training dilanjutkan dari epoch 31 / 200
+Epoch:   0%
+ 0/170 [00:00<?, ?epoch/s]
+  Train Epoch 31:   1%
+ 118/8651 [00:55<1:05:05,  2.18batch/s, loss=nan]

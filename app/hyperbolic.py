@@ -232,9 +232,16 @@ class HGCNLayer(nn.Module):
         out_dim = h_trans.shape[1]
 
         # Kumpulkan pesan: untuk tiap edge (src→dst), akumulasi fitur src ke bucket dst
+        # Chunked scatter_add_ — menghindari alokasi tensor (E, out_dim) sekaligus
+        # yang menyebabkan OOM pada graph besar (E >> 10 juta edge).
+        # Setiap chunk memproses maks _CHUNK edge sehingga alokasi intermediate terbatas.
         agg = torch.zeros(N, out_dim, device=x.device, dtype=h_trans.dtype)
-        idx = dst.unsqueeze(1).expand(-1, out_dim)    # (E, out_dim)
-        agg.scatter_add_(0, idx, h_trans[src])         # sum messages per dst node
+        _E = src.shape[0]
+        _CHUNK = 500_000
+        for _cs in range(0, _E, _CHUNK):
+            _ce = min(_cs + _CHUNK, _E)
+            _idx_c = dst[_cs:_ce].unsqueeze(1).expand(-1, out_dim)
+            agg.scatter_add_(0, _idx_c, h_trans[src[_cs:_ce]])
 
         # Hitung in-degree tiap node untuk normalisasi mean
         deg = torch.zeros(N, device=x.device, dtype=h_trans.dtype)
